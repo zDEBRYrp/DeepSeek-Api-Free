@@ -146,6 +146,10 @@ def _safe_json_loads(s: str):
         pass
     t = s.replace("```json", "").replace("```", "").replace("<tool_call>", "").replace("</tool_call>", "")
     t = t.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    # ремонт невалидных escape-последовательностей внутри строк (Windows-пути
+    # вида "C:\Users" -> \U не является валидным JSON-escape). Экранируем
+    # одиночный обратный слэш, который не стоит перед валидным escape-символом.
+    t = re.sub(r'(?<!\\)\\(?!["\\/bfnrtu])', r'\\\\', t)
     t = re.sub(r'"([^"]*?)\s*"\s*:', r'"\1":', t)
     try:
         return json.loads(t)
