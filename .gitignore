@@ -51,3 +51,7 @@ resp_tool.txt
 server_hf.out
 server_hf.err
 
+
+body_plain.json
+resp_plain.txt
+resp_tool.txt

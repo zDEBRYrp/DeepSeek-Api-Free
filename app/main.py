@@ -369,6 +369,21 @@ def _sse_chunk(data: dict) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+# Подсказка при авто-повторе, если модель вернула пустой ответ: заставляем
+# её выдать итоговый текст и не плодить лишние вызовы инструментов.
+EMPTY_ANSWER_NUDGE = (
+    "Ответь обязательно текстом, кратко и по существу. "
+    "Не вызывай инструменты повторно без крайней необходимости."
+)
+# Что вернуть клиенту, если после всех повторов ответ всё равно пустой
+# (чтобы клиент не зависал и не терял ход).
+EMPTY_ANSWER_FALLBACK = (
+    "⚠️ Модель вернула пустой ответ. Попробуйте переформулировать запрос "
+    "или повторите его через несколько секунд."
+)
+MAX_EMPTY_RETRIES = 2
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     # Обычная отправка требует поле messages.
@@ -390,7 +405,12 @@ async def chat_completions(request: ChatCompletionRequest):
 
     # Определяем источник приращений (kind, delta) в зависимости от режима запроса.
     # kind in {'reasoning','content'} - рассуждения DeepThink и итоговый ответ.
-    async def _source():
+    async def _source(nudge: bool = False):
+        # При повторе (nudge) докидываем подсказку «ответь текстом» в конец истории,
+        # чтобы модель не возвращала пустой ответ и не вызывала инструменты зря.
+        msgs = request.messages
+        if nudge and msgs:
+            msgs = list(msgs) + [ChatMessage(role="user", content=EMPTY_ANSWER_NUDGE)]
         # --- Регенерация последнего ответа ---
         if request.regenerate:
             async for kind, delta in browser_session.regenerate_stream(
@@ -409,16 +429,16 @@ async def chat_completions(request: ChatCompletionRequest):
         # --- Обычная отправка нового сообщения ---
         else:
             tools = request.tools
-            system_msgs = [m for m in request.messages if m.role == "system"]
+            system_msgs = [m for m in msgs if m.role == "system"]
             system_text = system_msgs[-1].content if system_msgs else ""
-            last_user = _extract_last_user_message(request.messages)
+            last_user = _extract_last_user_message(msgs)
             mode = settings.MEMORY_MODE
 
             if mode == "client":
                 # Клиент сам шлёт всю историю: сплющиваем её в ОДИН промпт и
                 # каждый раз начинаем НОВЫЙ чат DeepSeek (полностью stateless,
                 # без утечки прошлых ответов). Так работают opencode/Kilo Code.
-                conv = _flatten_conversation(request.messages)
+                conv = _flatten_conversation(msgs)
                 tool_instr = _build_tool_instruction(tools) if tools else ""
                 sys_part = system_text
                 if tool_instr:
@@ -438,7 +458,7 @@ async def chat_completions(request: ChatCompletionRequest):
             else:
                 # server-режим: отправляем последнее сообщение (user или
                 # результат инструмента) в существующий чат-тред DeepSeek.
-                last = _last_significant_message(request.messages)
+                last = _last_significant_message(msgs)
                 tool_instr = _build_tool_instruction(tools) if tools else ""
                 if last and last.role == "tool":
                     prompt = "[результат вызова инструмента]\n" + (last.content if isinstance(last.content, str) else "")
@@ -493,48 +513,67 @@ async def chat_completions(request: ChatCompletionRequest):
                         {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}
                     ],
                 })
+
+                # Генерация с авто-повтором: если модель вернула ПУСТОЙ ответ
+                # (без текста и без вызова инструмента), повторяем с подсказкой
+                # «ответь текстом», чтобы клиент не зависал и получал итог.
+                final_text = ""
+                final_tool_call = None
                 completion_tokens = 0
                 reasoning_tokens = 0
-                acc_text = ""   # полный накопленный ответ (для разбора tool_calls)
-                acc_reason = ""
-                # При наличии tools не стримим по кусочкам, а копим полный ответ,
-                # чтобы корректно отдать tool_calls в финальном чанке.
-                stream_incremental = not request.tools
-                try:
-                    async for kind, delta in _source():
-                        if kind == "reasoning":
-                            reasoning_tokens += _estimate_tokens(delta)
-                            acc_reason += delta
-                            if stream_incremental:
-                                yield _sse_chunk({
-                                    "id": chat_id, "object": "chat.completion.chunk",
-                                    "created": created, "model": request.model,
-                                    "choices": [{"index": 0, "delta": {"reasoning_content": delta}, "finish_reason": None}],
-                                })
-                        else:
-                            completion_tokens += _estimate_tokens(delta)
-                            acc_text += delta
-                            if stream_incremental:
-                                yield _sse_chunk({
-                                    "id": chat_id, "object": "chat.completion.chunk",
-                                    "created": created, "model": request.model,
-                                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-                                })
-                except BrowserSessionError as exc:
-                    yield _sse_chunk({"error": {"message": str(exc), "type": "server_error"}})
-                    return
-                except Exception as exc:
-                    logger.exception("Ошибка потоковой генерации")
-                    yield _sse_chunk({"error": {"message": f"Внутренняя ошибка: {exc}", "type": "server_error"}})
-                    return
+                attempt = 0
+                while True:
+                    acc_text = ""
+                    acc_reason = ""
+                    comp_tok = 0
+                    # При наличии tools не стримим по кусочкам, а копим полный ответ,
+                    # чтобы корректно отдать tool_calls в финальном чанке.
+                    stream_incremental = not request.tools
+                    try:
+                        async for kind, delta in _source(nudge=(attempt > 0)):
+                            if kind == "reasoning":
+                                reasoning_tokens += _estimate_tokens(delta)
+                                acc_reason += delta
+                                if stream_incremental:
+                                    yield _sse_chunk({
+                                        "id": chat_id, "object": "chat.completion.chunk",
+                                        "created": created, "model": request.model,
+                                        "choices": [{"index": 0, "delta": {"reasoning_content": delta}, "finish_reason": None}],
+                                    })
+                            else:
+                                comp_tok += _estimate_tokens(delta)
+                                acc_text += delta
+                                if stream_incremental:
+                                    yield _sse_chunk({
+                                        "id": chat_id, "object": "chat.completion.chunk",
+                                        "created": created, "model": request.model,
+                                        "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                                    })
+                    except BrowserSessionError as exc:
+                        yield _sse_chunk({"error": {"message": str(exc), "type": "server_error"}})
+                        return
+                    except Exception as exc:
+                        logger.exception("Ошибка потоковой генерации")
+                        yield _sse_chunk({"error": {"message": f"Внутренняя ошибка: {exc}", "type": "server_error"}})
+                        return
 
-                # Разбор вызова инструмента (если клиент передал tools).
-                tool_call = None
-                if request.tools:
-                    parsed, stripped = _parse_tool_call(acc_text, request.tools)
-                    if parsed:
-                        tool_call = parsed
-                        acc_text = stripped
+                    # Разбор вызова инструмента (если клиент передал tools).
+                    tool_call = None
+                    if request.tools and acc_text:
+                        parsed, stripped = _parse_tool_call(acc_text, request.tools)
+                        if parsed:
+                            tool_call = parsed
+                            acc_text = stripped
+
+                    if acc_text or tool_call:
+                        final_text, final_tool_call = acc_text, tool_call
+                        completion_tokens = comp_tok
+                        break
+                    # Пустой ответ — повторяем с подсказкой, иначе заглушка.
+                    attempt += 1
+                    if attempt > MAX_EMPTY_RETRIES:
+                        final_text = EMPTY_ANSWER_FALLBACK
+                        break
 
                 total_tokens, ds_counter = await _finalize_usage(
                     prompt_tokens, completion_tokens
@@ -547,7 +586,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     except Exception:
                         citations = []
 
-                if tool_call:
+                if final_tool_call:
                     # Чанк с вызовом инструмента (совместимо с OpenAI SDK):
                     # сначала delta с tool_calls (finish_reason=null), затем пустой
                     # чанк с finish_reason="tool_calls".
@@ -557,8 +596,8 @@ async def chat_completions(request: ChatCompletionRequest):
                         "conversation_id": conv_id,
                         "choices": [{"index": 0, "delta": {"tool_calls": [
                             {"index": 0, "id": f"call_{uuid.uuid4().hex[:12]}", "type": "function",
-                             "function": {"name": tool_call["name"],
-                                          "arguments": json.dumps(tool_call["arguments"], ensure_ascii=False)}}
+                             "function": {"name": final_tool_call["name"],
+                                          "arguments": json.dumps(final_tool_call["arguments"], ensure_ascii=False)}}
                         ]}, "finish_reason": None}],
                     })
                     yield _sse_chunk({
@@ -588,7 +627,7 @@ async def chat_completions(request: ChatCompletionRequest):
                             "ds_token_counter": ds_counter,
                         },
                         **({"citations": citations} if citations else {}),
-                })
+                    })
                 yield "data: [DONE]\n\n"
             finally:
                 # Потоковый режим освобождает слот сам, по завершении генерации.
@@ -609,12 +648,38 @@ async def chat_completions(request: ChatCompletionRequest):
         try:
             response_text = ""
             reasoning_text = ""
-            async for kind, delta in _source():
-                if kind == "reasoning":
-                    reasoning_text += delta
-                else:
-                    response_text += delta
-            if browser_session._looks_busy(response_text):
+            tool_calls_obj = None
+            attempt = 0
+            while True:
+                rtext = ""
+                rreason = ""
+                async for kind, delta in _source(nudge=(attempt > 0)):
+                    if kind == "reasoning":
+                        rreason += delta
+                    else:
+                        rtext += delta
+                # Разбор вызова инструмента (если клиент передал tools).
+                parsed = None
+                if request.tools and rtext:
+                    parsed, stripped = _parse_tool_call(rtext, request.tools)
+                    if parsed:
+                        rtext = stripped
+                if rtext or parsed:
+                    response_text = rtext
+                    reasoning_text = rreason
+                    if parsed:
+                        tool_calls_obj = [ToolCall(function=ToolCallFunction(
+                            name=parsed["name"],
+                            arguments=json.dumps(parsed["arguments"], ensure_ascii=False),
+                        ))]
+                    break
+                # Пустой ответ — повторяем с подсказкой, иначе заглушка.
+                attempt += 1
+                if attempt > MAX_EMPTY_RETRIES:
+                    response_text = EMPTY_ANSWER_FALLBACK
+                    break
+
+            if tool_calls_obj is None and browser_session._looks_busy(response_text):
                 raise BrowserSessionError(
                     "DeepSeek временно занят (одновременно обрабатывается только один запрос). "
                     "Подождите несколько секунд и повторите запрос."
@@ -625,16 +690,7 @@ async def chat_completions(request: ChatCompletionRequest):
             logger.exception("Ошиброобработки запроса")
             raise HTTPException(status_code=500, detail=f"Внутренняя ошибка: {exc}") from exc
 
-        # Разбор вызова инструмента (если клиент передал tools).
-        tool_calls_obj = None
-        if request.tools:
-            parsed, stripped = _parse_tool_call(response_text, request.tools)
-            if parsed:
-                tool_calls_obj = [ToolCall(function=ToolCallFunction(
-                    name=parsed["name"],
-                    arguments=json.dumps(parsed["arguments"], ensure_ascii=False),
-                ))]
-                response_text = stripped
+        # (tool_calls_obj уже сформирован выше)
 
         prompt_tokens = sum(_estimate_tokens(m.content) for m in (request.messages or []))
         completion_tokens = _estimate_tokens(response_text)
