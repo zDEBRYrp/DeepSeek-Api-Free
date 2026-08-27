@@ -5,9 +5,9 @@
 
 import time
 import uuid
-from typing import List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ImagePart(BaseModel):
@@ -16,10 +16,50 @@ class ImagePart(BaseModel):
     value: str
 
 
+def _image_part_from_url(url: str) -> Dict[str, str]:
+    """Конвертирует URL/Data-URI изображения в формат ImagePart."""
+    if url.startswith("data:image"):
+        # data:image/png;base64,xxxx -> забираем часть после запятой
+        return {"type": "image_base64", "value": url.partition(",")[2]}
+    if url.startswith(("http://", "https://")):
+        return {"type": "image_url", "value": url}
+    return {"type": "image_path", "value": url}
+
+
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
-    content: str
+    # OpenAI-совместимо: content может быть строкой ИЛИ списком content-частей
+    # (multimodal: [{"type":"text","text":...}, {"type":"image_url","image_url":{...}}]).
+    content: Union[str, List[Dict[str, Any]]] = ""
     images: Optional[List[ImagePart]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_content(cls, data):
+        if not isinstance(data, dict):
+            return data
+        content = data.get("content")
+        if isinstance(content, list):
+            texts: List[str] = []
+            imgs = list(data.get("images") or [])
+            for part in content:
+                if not isinstance(part, dict):
+                    texts.append(str(part))
+                    continue
+                ptype = part.get("type", "text")
+                if ptype == "text":
+                    texts.append(str(part.get("text", "")))
+                elif ptype == "image_url":
+                    url = part.get("image_url", {})
+                    if isinstance(url, dict):
+                        url = url.get("url", "")
+                    if url:
+                        imgs.append(_image_part_from_url(url))
+                # input_audio и прочие типы игнорируем
+            data = dict(data)
+            data["content"] = "\n".join(t for t in texts if t)
+            data["images"] = imgs
+        return data
 
 
 class EditInstruction(BaseModel):
