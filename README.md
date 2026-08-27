@@ -14,9 +14,9 @@ OpenAI-совместимого клиента: поддерживаются р�
 - OpenAI-совместимый `/v1/chat/completions` (stream + non-stream).
 - Режимы DeepSeek через поле `model`:
   - `deepseek-chat` — обычный режим
-  - `deepseek-think` / `deepseek-reasoner` — DeepThink (рассуждения в `reasoning_content`)
+  - `deepseek-think` — DeepThink (рассуждения в `reasoning_content`)
   - `deepseek-search` — Web-Search
-  - `deepseek-think-search` / `deepseek-reasoner-search` — DeepThink + Search
+  - `deepseek-think-search` — DeepThink + Search
   - либо явно флагами `deep_think` / `search`.
 - `reasoning_content` — цепочка рассуждений DeepThink (в потоке и в обычном режиме).
 - `conversation_id` — идентификатор чата DeepSeek для продолжения диалога.

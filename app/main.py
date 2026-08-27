@@ -174,39 +174,26 @@ async def stop_generation():
 
 @app.get("/v1/models")
 async def list_models():
-    """Список доступных «моделей» - режимов (think/search) обёртки."""
+    """Список доступных «моделей» - режимов (think/search) обёртки.
+    Формируется из MODE_TOGGLES (единственный источник правды)."""
     owned = "deepseek-chat"
-    models = [
+    descriptions = {
+        (False, False): "Обычный режим (без DeepThink и без поиска).",
+        (True, False): "DeepThink вкл, поиск выкл (аналог Reasoner).",
+        (False, True): "Web-поиск вкл, DeepThink выкл.",
+        (True, True): "DeepThink + Web-поиск одновременно.",
+    }
+    data = [
         {
-            "id": "deepseek-chat",
+            "id": name,
             "object": "model",
             "created": 0,
             "owned_by": owned,
-            "description": "Обычный режим (без DeepThink и без поиска).",
-        },
-        {
-            "id": "deepseek-think",
-            "object": "model",
-            "created": 0,
-            "owned_by": owned,
-            "description": "DeepThink вкл, поиск выкл (аналог Reasoner).",
-        },
-        {
-            "id": "deepseek-search",
-            "object": "model",
-            "created": 0,
-            "owned_by": owned,
-            "description": "Web-поиск вкл, DeepThink выкл.",
-        },
-        {
-            "id": "deepseek-think-search",
-            "object": "model",
-            "created": 0,
-            "owned_by": owned,
-            "description": "DeepThink + Web-поиск одновременно.",
-        },
+            "description": descriptions.get(flags, "Режим DeepSeek."),
+        }
+        for name, flags in settings.MODE_TOGGLES.items()
     ]
-    return {"object": "list", "data": models}
+    return {"object": "list", "data": data}
 
 
 @app.get("/debug/extract")

@@ -176,8 +176,8 @@ class Settings:
     MODE_TOGGLES: dict = {}
     for _pair in os.getenv(
         "MODE_TOGGLES",
-        "deepseek-chat:0:0,deepseek-think:1:0,deepseek-reasoner:1:0,"
-        "deepseek-search:0:1,deepseek-think-search:1:1,deepseek-reasoner-search:1:1",
+        "deepseek-chat:0:0,deepseek-think:1:0,"
+        "deepseek-search:0:1,deepseek-think-search:1:1",
     ).split(","):
         if ":" in _pair:
             _name, _d, _s = _pair.split(":")

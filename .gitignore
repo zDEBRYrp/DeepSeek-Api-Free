@@ -16,8 +16,7 @@ env/
 .env.local
 *.sqlite3
 data/
-pw_profile/
-pw_profile_test/
+pw_profile*/
 
 # --- Cookies / сессии браузера ---
 cookies.txt
@@ -43,3 +42,5 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+hf_pid.txt
+*.pid
