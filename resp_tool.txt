@@ -1,0 +1,8 @@
+data: {"id": "chatcmpl-a1cfafc5e81041cd8ed3bd9572da7160", "object": "chat.completion.chunk", "created": 1787842957, "model": "deepseek-chat", "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-a1cfafc5e81041cd8ed3bd9572da7160", "object": "chat.completion.chunk", "created": 1787842957, "model": "deepseek-chat", "conversation_id": "f5d0946c-1042-457e-a8d5-8e24fa42e0f9", "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_8ed73ccfa395", "type": "function", "function": {"name": "bash", "arguments": "{\"command\": \"echo hi_there_123\"}"}}]}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-a1cfafc5e81041cd8ed3bd9572da7160", "object": "chat.completion.chunk", "created": 1787842957, "model": "deepseek-chat", "conversation_id": "f5d0946c-1042-457e-a8d5-8e24fa42e0f9", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 19, "completion_tokens": 18, "total_tokens": 37, "ds_token_counter": null}}
+
+data: [DONE]
+

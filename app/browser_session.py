@@ -715,9 +715,8 @@ class BrowserSession:
         reasoning и content внутри последней обёртки ассистента."""
         try:
             res = await self._page.evaluate(
-                EXTRACT_FN_SRC
+                "(el) => { " + self.EXTRACT_FN_SRC
                 + """
-                () => {
                     const wrappers = Array.from(
                         document.querySelectorAll(
                             "div[class*='ds-message']:not([class*='main-content'])"

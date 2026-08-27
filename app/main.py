@@ -104,32 +104,89 @@ def _build_tool_instruction(tools: Optional[List[Tool]]) -> str:
     if not tools:
         return ""
     lines = [
-        "Тебе доступны инструменты. Если ты решаешь вызвать инструмент - ответь "
-        "ТОЛЬКО одним fenced JSON-блоком вида и больше ничего не пиши:",
+        "Тебе доступны инструменты (function calling). Когда нужно вызвать инструмент, "
+        "ответь СТРОГО ОДНИМ fenced JSON-блоком и больше ничего не пиши:",
         "```json",
-        '{"name": "<имя_инструмента>", "arguments": { ... }}',
+        '{"name": "<точное_имя_инструмента>", "arguments": { ... }}',
         "```",
-        "Когда тебе вернут результат инструмента, продолжи помогать пользователю.",
+        "Имя инструмента должно быть ТОЧНО из списка ниже. Поле arguments — объект с "
+        "параметрами по схеме инструмента. Когда получишь результат инструмента, "
+        "продолжи помогать пользователю.",
         "Доступные инструменты:",
     ]
     for t in tools:
         f = t.function
-        lines.append(f"- {f.get('name')}: {f.get('description', '')}")
+        params = f.get("parameters", {})
+        lines.append(
+            f"- {f.get('name')}: {f.get('description', '')}  "
+            f"схема аргументов: {json.dumps(params, ensure_ascii=False)}"
+        )
     return "\n".join(lines)
+
+
+def _extract_json_objects(text: str):
+    """Возвращает список (start, end, dict) для всех сбалансированных JSON-объектов
+    верхнего уровня в тексте (с учётом вложенности и строк)."""
+    objs = []
+    start = None
+    depth = 0
+    in_str = False
+    esc = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    objs.append((start, i + 1, json.loads(text[start:i + 1])))
+                except Exception:
+                    pass
+                start = None
+    return objs
 
 
 def _parse_tool_call(text: str, tools: Optional[List[Tool]]):
     """Ищет в ответе DeepSeek вызов инструмента. Возвращает
-    (dict {name, arguments(dict)}, очищенный_текст) или (None, text)."""
+    (dict {name, arguments(dict)}, очищенный_текст) или (None, text).
+
+    Устойчив к формату: fenced ```json, <tool_call>, голый JSON в тексте,
+    вложенные скобки в arguments. Имя инструмента НЕ фильтруется жёстко —
+    клиент сам решает, есть ли у него такой инструмент.
+    """
     if not tools:
         return None, text
-    allowed = {t.function.get("name") for t in tools}
-    candidates = re.findall(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
-    candidates += re.findall(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL)
-    for c in candidates:
-        try:
-            obj = json.loads(c)
-        except Exception:
+    candidates = []  # (start, end, raw_or_dict)
+    for m in re.finditer(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL):
+        candidates.append((m.start(1), m.end(1), m.group(1)))
+    for m in re.finditer(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL):
+        candidates.append((m.start(1), m.end(1), m.group(1)))
+    for s, e, obj in _extract_json_objects(text):
+        candidates.append((s, e, obj))
+    norm = []
+    for s, e, raw in candidates:
+        if isinstance(raw, str):
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+        else:
+            obj = raw
+        norm.append((s, e, obj))
+    for s, e, obj in norm:
+        if not isinstance(obj, dict):
             continue
         name = obj.get("name") or (obj.get("function") or {}).get("name")
         args = obj.get("arguments", {})
@@ -138,10 +195,15 @@ def _parse_tool_call(text: str, tools: Optional[List[Tool]]):
                 args = json.loads(args)
             except Exception:
                 args = {}
-        if name and (name in allowed):
-            stripped = text.replace("```json\n" + c + "\n```", "").replace(
-                "<tool_call>" + c + "</tool_call>", ""
-            ).strip()
+        if name and isinstance(args, dict):
+            stripped = (text[:s] + text[e:]).strip()
+            stripped = (
+                stripped.replace("```json", "")
+                .replace("```", "")
+                .replace("<tool_call>", "")
+                .replace("</tool_call>", "")
+                .strip()
+            )
             return {"name": name, "arguments": args}, stripped
     return None, text
 
@@ -486,7 +548,9 @@ async def chat_completions(request: ChatCompletionRequest):
                         citations = []
 
                 if tool_call:
-                    # Чанк с вызовом инструмента.
+                    # Чанк с вызовом инструмента (совместимо с OpenAI SDK):
+                    # сначала delta с tool_calls (finish_reason=null), затем пустой
+                    # чанк с finish_reason="tool_calls".
                     yield _sse_chunk({
                         "id": chat_id, "object": "chat.completion.chunk",
                         "created": created, "model": request.model,
@@ -495,7 +559,13 @@ async def chat_completions(request: ChatCompletionRequest):
                             {"index": 0, "id": f"call_{uuid.uuid4().hex[:12]}", "type": "function",
                              "function": {"name": tool_call["name"],
                                           "arguments": json.dumps(tool_call["arguments"], ensure_ascii=False)}}
-                        ]}, "finish_reason": "tool_calls"}],
+                        ]}, "finish_reason": None}],
+                    })
+                    yield _sse_chunk({
+                        "id": chat_id, "object": "chat.completion.chunk",
+                        "created": created, "model": request.model,
+                        "conversation_id": conv_id,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
                         "usage": {
                             "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                             "total_tokens": total_tokens, "ds_token_counter": ds_counter,
@@ -582,7 +652,7 @@ async def chat_completions(request: ChatCompletionRequest):
             model=request.model,
             choices=[Choice(
                 message=ChoiceMessage(
-                    content=response_text if response_text else None,
+                    content=None if tool_calls_obj else (response_text if response_text else None),
                     reasoning_content=reasoning_text or None,
                     tool_calls=tool_calls_obj,
                 ),
