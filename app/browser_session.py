@@ -873,7 +873,7 @@ class BrowserSession:
                     )
                 await asyncio.sleep(3)
 
-        if len(text) > settings.MAX_MESSAGE_LENGTH:
+        if settings.MAX_MESSAGE_LENGTH and len(text) > settings.MAX_MESSAGE_LENGTH:
             raise BrowserSessionError(
                 f"Сообщение превышает допустимую длину ({settings.MAX_MESSAGE_LENGTH} символов)."
             )

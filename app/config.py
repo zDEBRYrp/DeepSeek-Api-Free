@@ -71,7 +71,9 @@ class Settings:
     ACTION_TIMEOUT_MS: int = int(os.getenv("ACTION_TIMEOUT_MS", "10000"))  # ~10 сек на клики/ввод
 
     # --- Лимиты ---
-    MAX_MESSAGE_LENGTH: int = int(os.getenv("MAX_MESSAGE_LENGTH", "8000"))
+    # Максимальная длина одного сообщения (символов). 0 = без ограничения
+    # (DeepSeek сам обрабатывает очень длинные вставки, преобразуя их в .txt-вложение).
+    MAX_MESSAGE_LENGTH: int = int(os.getenv("MAX_MESSAGE_LENGTH", "0"))
     MAX_FILES_PER_MESSAGE: int = int(os.getenv("MAX_FILES_PER_MESSAGE", "5"))
     MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "2"))
 

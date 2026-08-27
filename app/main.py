@@ -339,11 +339,11 @@ async def chat_completions(request: ChatCompletionRequest):
                             ],
                         })
                 except BrowserSessionError as exc:
-                    yield _sse_chunk({"error": str(exc)})
+                    yield _sse_chunk({"error": {"message": str(exc), "type": "server_error"}})
                     return
                 except Exception as exc:
                     logger.exception("Ошибка потоковой генерации")
-                    yield _sse_chunk({"error": f"Внутренняя ошибка: {exc}"})
+                    yield _sse_chunk({"error": {"message": f"Внутренняя ошибка: {exc}", "type": "server_error"}})
                     return
 
                 total_tokens, ds_counter = await _finalize_usage(
@@ -434,6 +434,18 @@ async def chat_completions(request: ChatCompletionRequest):
         REQUEST_SEM.release()
 
 
+def _openai_error(status: int, message: str, etype: str) -> JSONResponse:
+    # OpenAI-совместимый вид ошибки, чтобы зод-валидирующие клиенты
+    # (AI SDK и др.) выдавали понятное сообщение, а не "Type validation failed".
+    return JSONResponse(status_code=status, content={"error": {"message": message, "type": etype}})
+
+
 @app.exception_handler(BrowserSessionError)
 async def browser_error_handler(_, exc: BrowserSessionError):
-    return JSONResponse(status_code=502, content={"error": str(exc)})
+    return _openai_error(502, str(exc), "server_error")
+
+
+@app.exception_handler(HTTPException)
+async def http_error_handler(_, exc: HTTPException):
+    etype = "invalid_request_error" if exc.status_code == 400 else "server_error"
+    return _openai_error(exc.status_code, str(exc.detail), etype)
