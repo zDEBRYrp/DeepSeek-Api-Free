@@ -107,12 +107,20 @@ def _build_tool_instruction(tools: Optional[List[Tool]]) -> str:
         return ""
     lines = [
         "Тебе доступны инструменты (function calling). Когда нужно вызвать инструмент, "
-        "выведи ТОЛЬКО ОДНУ СТРОКУ чистого JSON без оформления — НЕ используй markdown, "
-        "НЕ оборачивай в ```json заборы, НЕ ставь переносы строк внутри JSON:",
+        "оформи вызов как ОДНУ СТРОКУ чистого JSON без markdown-оформления — НЕ оборачивай "
+        "в ```json заборы, НЕ ставь переносы строк внутри JSON. Перед вызовом МОЖНО "
+        "написать краткое пояснение (например, 'Проверю файлы:'), но сам JSON-вызов "
+        "должен быть на отдельной строке и легко отделяться от текста:",
         '{"name": "<точное_имя_инструмента>", "arguments": { ... }}',
         "Имя инструмента должно быть ТОЧНО из списка ниже. Поле arguments — объект с "
         "параметрами по схеме инструмента. Когда получишь результат инструмента, "
         "продолжи помогать пользователю.",
+        "ВАЖНО: когда вызываешь инструмент, выведи JSON-вызов на отдельной строке без "
+        "markdown-оформления; перед ним МОЖЕШЬ написать краткое пояснение (например, "
+        "'Проверю файлы:'), но сам вызов должен быть валидным JSON и чётко отделяться "
+        "от текста. НЕ ставь восклицательные знаки внутри/рядом с JSON и не оборачивай "
+        "вызов в ``` заборы. Результат работы инструмента придёт отдельным сообщением "
+        "в СЛЕДУЮЩЕМ ответе, и ты продолжишь работу уже на его основе.",
         "ВАЖНО: в arguments передавай ТОЛЬКО те поля, что перечислены в схеме "
         "параметров инструмента. НЕ выдумывай и не добавляй свои поля "
         "(workdir, cwd, path, directory и т.п.) — клиент их не понимает и вызов "
@@ -789,9 +797,17 @@ async def chat_completions(request: ChatCompletionRequest):
 
                 if final_tool_calls:
                     # Чанк с вызовом инструмента (совместимо с OpenAI SDK):
-                    # сначала delta с tool_calls (finish_reason=null), затем пустой
+                    # если перед вызовом был текст (final_text), отдаём его контентом,
+                    # затем delta с tool_calls (finish_reason=null), затем пустой
                     # чанк с finish_reason="tool_calls". Поддерживаем несколько
                     # параллельных вызовов (каждый со своим index/id).
+                    if final_text:
+                        yield _sse_chunk({
+                            "id": chat_id, "object": "chat.completion.chunk",
+                            "created": created, "model": request.model,
+                            "conversation_id": conv_id,
+                            "choices": [{"index": 0, "delta": {"content": final_text}, "finish_reason": None}],
+                        })
                     tc_delta = [
                         {"index": i, "id": f"call_{uuid.uuid4().hex[:12]}", "type": "function",
                          "function": {"name": tc["name"],
@@ -935,7 +951,7 @@ async def chat_completions(request: ChatCompletionRequest):
             model=request.model,
             choices=[Choice(
                 message=ChoiceMessage(
-                    content=None if tool_calls_obj else (response_text if response_text else None),
+                    content=(response_text if response_text else None),
                     reasoning_content=reasoning_text or None,
                     tool_calls=tool_calls_obj,
                 ),
