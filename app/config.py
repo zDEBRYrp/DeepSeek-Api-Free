@@ -82,6 +82,10 @@ class Settings:
     #            и каждый запрос начинает НОВЫЙ чат DeepSeek. Полностью stateless,
     #            нет утечки прошлых ответов. Нужен для opencode/Kilo Code.
     MEMORY_MODE: str = os.getenv("MEMORY_MODE", "server").strip().lower()
+    # Рабочая директория проекта. Подсказывается модели, чтобы та использовала
+    # абсолютные пути (независимо от cwd клиента, исполняющего команду).
+    # Пусто = cwd процесса сервера (обычно папка, откуда запущен uvicorn).
+    WORK_DIR: str = os.getenv("WORK_DIR", "").strip()
     MAX_FILES_PER_MESSAGE: int = int(os.getenv("MAX_FILES_PER_MESSAGE", "5"))
     MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "2"))
 
