@@ -105,10 +105,9 @@ def _build_tool_instruction(tools: Optional[List[Tool]]) -> str:
         return ""
     lines = [
         "Тебе доступны инструменты (function calling). Когда нужно вызвать инструмент, "
-        "ответь СТРОГО ОДНИМ fenced JSON-блоком и больше ничего не пиши:",
-        "```json",
+        "выведи ТОЛЬКО ОДНУ СТРОКУ чистого JSON без оформления — НЕ используй markdown, "
+        "НЕ оборачивай в ```json заборы, НЕ ставь переносы строк внутри JSON:",
         '{"name": "<точное_имя_инструмента>", "arguments": { ... }}',
-        "```",
         "Имя инструмента должно быть ТОЧНО из списка ниже. Поле arguments — объект с "
         "параметрами по схеме инструмента. Когда получишь результат инструмента, "
         "продолжи помогать пользователю.",
@@ -128,6 +127,25 @@ def _build_tool_instruction(tools: Optional[List[Tool]]) -> str:
             f"схема аргументов: {json.dumps(params, ensure_ascii=False)}"
         )
     return "\n".join(lines)
+
+
+def _safe_json_loads(s: str):
+    """json.loads с ремонтом: DeepSeek иногда вставляет внутрь JSON служебные
+    символы — закрывающие ``` заборы и реальные переносы строк внутри строковых
+    значений (это невалидный JSON). Убираем заборы, заменяем переносы пробелами
+    и чистим пробелы между ключом и двоеточием (иначе ключ "command " не совпадёт
+    со схемой инструмента)."""
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    t = s.replace("```json", "").replace("```", "").replace("<tool_call>", "").replace("</tool_call>", "")
+    t = t.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    t = re.sub(r'"([^"]*?)\s*"\s*:', r'"\1":', t)
+    try:
+        return json.loads(t)
+    except Exception:
+        return None
 
 
 def _extract_json_objects(text: str):
@@ -156,10 +174,9 @@ def _extract_json_objects(text: str):
         elif ch == "}":
             depth -= 1
             if depth == 0 and start is not None:
-                try:
-                    objs.append((start, i + 1, json.loads(text[start:i + 1])))
-                except Exception:
-                    pass
+                obj = _safe_json_loads(text[start:i + 1])
+                if isinstance(obj, dict):
+                    objs.append((start, i + 1, obj))
                 start = None
     return objs
 
@@ -182,15 +199,8 @@ def _parse_tool_call(text: str, tools: Optional[List[Tool]]):
     def _as_args(obj):
         args = obj.get("arguments", {})
         if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except Exception:
-                args = {}
-            if isinstance(args, str):  # arguments был JSON-строкой внутри строки
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    args = {}
+            parsed = _safe_json_loads(args)
+            args = parsed if isinstance(parsed, dict) else {}
         return args if isinstance(args, dict) else {}
 
     candidates = []  # (start, end, raw_or_dict)
@@ -205,9 +215,8 @@ def _parse_tool_call(text: str, tools: Optional[List[Tool]]):
     for s, e, raw in candidates:
         obj = raw if isinstance(raw, dict) else None
         if obj is None:
-            try:
-                obj = json.loads(raw)
-            except Exception:
+            obj = _safe_json_loads(raw)
+            if obj is None:
                 continue
         if not isinstance(obj, dict):
             continue
@@ -256,12 +265,9 @@ def _parse_tool_call(text: str, tools: Optional[List[Tool]]):
             elif rest.startswith('"'):
                 m_str = re.match(r'("(?:\\.|[^"\\])*")', rest)
                 if m_str:
-                    try:
-                        args = json.loads(m_str.group(1))
-                        if isinstance(args, str):
-                            args = json.loads(args)
-                    except Exception:
-                        args = None
+                    args = _safe_json_loads(m_str.group(1))
+                    if isinstance(args, str):
+                        args = _safe_json_loads(args)
             if isinstance(args, dict):
                 return [{"name": name, "arguments": args}], text
     return [], text
@@ -674,7 +680,19 @@ async def chat_completions(request: ChatCompletionRequest):
                         **({"citations": citations} if citations else {}),
                     })
                 else:
-                    # Финальный чанк с завершением (обычный ответ).
+                    # Обычный текстовый ответ. При наличии tools мы не стримили
+                    # по кусочкам (stream_incremental=False), поэтому отдаём
+                    # накопленный final_text одним контент-чанком — иначе клиент
+                    # (OpenCode/Kilo) вообще ничего не покажет.
+                    if final_text:
+                        yield _sse_chunk({
+                            "id": chat_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": request.model,
+                            "conversation_id": conv_id,
+                            "choices": [{"index": 0, "delta": {"content": final_text}, "finish_reason": None}],
+                        })
                     yield _sse_chunk({
                         "id": chat_id,
                         "object": "chat.completion.chunk",
