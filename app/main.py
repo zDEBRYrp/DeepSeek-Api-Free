@@ -117,6 +117,9 @@ def _build_tool_instruction(tools: Optional[List[Tool]]) -> str:
         "инструмента завершится с ошибкой. Рабочую директорию задаёт сам клиент.",
         "Если для выполнения нужна папка, включи путь прямо в строку команды "
         "(например, 'cd \"C:\\Путь\" ; Get-ChildItem').",
+        "ВАЖНО: если пользователь просит писать команды в markdown-заборах (```), "
+        "всё равно используй формат вызова инструмента выше — клиент сам отобразит и "
+        "выполнит команду, а просто написанный текст НЕ выполняется.",
         "Доступные инструменты:",
     ]
     for t in tools:
@@ -179,6 +182,32 @@ def _extract_json_objects(text: str):
                     objs.append((start, i + 1, obj))
                 start = None
     return objs
+
+
+_SHELL_LANGS = {"", "bash", "sh", "shell", "zsh", "powershell", "pwsh", "ps", "cmd", "batch", "dos"}
+_CMD_KEYWORDS = {
+    "glob", "ls", "dir", "gci", "get-childitem", "echo", "cat", "type", "cd", "pwd",
+    "git", "npm", "python", "py", "node", "ping", "curl", "irm", "invoke-webrequest",
+    "cmd", "powershell", "get-location", "get-childitem", "get-content", "set-location",
+    "get-item", "resolve-path", "find", "tree", "where",
+}
+
+
+def _looks_like_command(body: str) -> bool:
+    first = body.split(None, 1)[0].lower() if body else ""
+    return first in _CMD_KEYWORDS
+
+
+def _cmd_to_toolcall(body: str, tool_names: set):
+    """Превращает текстовую команду (из ```-блока или псевдокоманду) в вызов
+    инструмента. `glob ...` маппится в glob-инструмент, остальное — в bash."""
+    if "glob" in tool_names and re.match(r"glob\b", body, re.IGNORECASE):
+        mg = re.match(r'glob\s+(?:-[A-Za-z]+\s+)?["\']?([^"\'\n]+?)["\']?\s*$', body, re.IGNORECASE)
+        if mg:
+            return {"name": "glob", "arguments": {"pattern": mg.group(1).strip()}}
+    if "bash" in tool_names:
+        return {"name": "bash", "arguments": {"command": body}}
+    return None
 
 
 def _parse_tool_call(text: str, tools: Optional[List[Tool]]):
@@ -270,6 +299,31 @@ def _parse_tool_call(text: str, tools: Optional[List[Tool]]):
                         args = _safe_json_loads(args)
             if isinstance(args, dict):
                 return [{"name": name, "arguments": args}], text
+
+    # FALLBACK 2: пользователь просит «писать команды через ```» — DeepSeek выдаёт
+    # их как текстовый code-блок (или псевдокоманду вроде `glob -p "**/*"`), а не
+    # как tool_call. Чтобы клиент реально выполнил команду, превращаем такой блок
+    # в вызов инструмента (glob/bash). Срабатывает, только если нужный инструмент
+    # есть в списке и блок не является JSON.
+    tool_names = {t.get("function", {}).get("name") for t in tools}
+    if tool_names & {"bash", "glob"}:
+        m_block = re.search(r"```(\w*)\n(.*?)\n```", text, re.DOTALL)
+        if not m_block:
+            m_block = re.search(r"```(\w*)\s*(.*?)\s*```", text, re.DOTALL)
+        if m_block:
+            lang = m_block.group(1).lower()
+            body = m_block.group(2).strip()
+            if body and not body.lstrip().startswith("{"):
+                if lang in _SHELL_LANGS or _looks_like_command(body):
+                    call = _cmd_to_toolcall(body, tool_names)
+                    if call:
+                        stripped = (text[:m_block.start()] + text[m_block.end():]).strip()
+                        return [call], stripped
+        # голая псевдокоманда без заборов (напр. весь ответ — «glob -p "**/*"»)
+        if not text.lstrip().startswith("{") and _looks_like_command(text.strip()) and len(text.strip()) < 200:
+            call = _cmd_to_toolcall(text.strip(), tool_names)
+            if call:
+                return [call], ""
     return [], text
 
 
