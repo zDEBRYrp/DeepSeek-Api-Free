@@ -44,3 +44,10 @@ Thumbs.db
 *.swp
 hf_pid.txt
 *.pid
+
+# debug/test artifacts
+body_tool.json
+resp_tool.txt
+server_hf.out
+server_hf.err
+

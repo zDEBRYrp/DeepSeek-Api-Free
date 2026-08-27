@@ -1,3 +1,0 @@
-INFO:     127.0.0.1:64857 - "GET /healthz HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54127 - "GET /healthz HTTP/1.1" 200 OK
-INFO:     127.0.0.1:53176 - "POST /v1/chat/completions HTTP/1.1" 200 OK
