@@ -165,15 +165,34 @@ def _extract_json_objects(text: str):
 
 
 def _parse_tool_call(text: str, tools: Optional[List[Tool]]):
-    """Ищет в ответе DeepSeek вызов инструмента. Возвращает
-    (dict {name, arguments(dict)}, очищенный_текст) или (None, text).
+    """Ищет в ответе DeepSeek вызовы инструмента. Возвращает
+    (list[dict{name, arguments(dict)}], очищенный_текст). Пустой список = нет вызовов.
 
-    Устойчив к формату: fenced ```json, <tool_call>, голый JSON в тексте,
-    вложенные скобки в arguments. Имя инструмента НЕ фильтруется жёстко —
-    клиент сам решает, есть ли у него такой инструмент.
+    Может вернуть несколько вызовов (параллельные tool_calls). Устойчив к формату:
+    fenced ```json, <tool_call>, голый JSON в тексте, вложенные скобки в arguments.
+    Имя инструмента НЕ фильтруется жёстко — клиент сам решает, есть ли у него такой инструмент.
+
+    FALLBACK: DeepSeek иногда «ломает» fenced-JSON, вставляя закрывающий ``` прямо
+    посреди объекта (напр. {"name": "bash", " \n ```arguments": {"command": ...}}). Тогда
+    цельный JSON не парсится — вытаскиваем name и arguments по отдельности регэкспами.
     """
     if not tools:
-        return None, text
+        return [], text
+
+    def _as_args(obj):
+        args = obj.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {}
+            if isinstance(args, str):  # arguments был JSON-строкой внутри строки
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+        return args if isinstance(args, dict) else {}
+
     candidates = []  # (start, end, raw_or_dict)
     for m in re.finditer(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL):
         candidates.append((m.start(1), m.end(1), m.group(1)))
@@ -181,37 +200,71 @@ def _parse_tool_call(text: str, tools: Optional[List[Tool]]):
         candidates.append((m.start(1), m.end(1), m.group(1)))
     for s, e, obj in _extract_json_objects(text):
         candidates.append((s, e, obj))
-    norm = []
+
+    found = []  # (start, end, name, args)
     for s, e, raw in candidates:
-        if isinstance(raw, str):
+        obj = raw if isinstance(raw, dict) else None
+        if obj is None:
             try:
                 obj = json.loads(raw)
             except Exception:
                 continue
-        else:
-            obj = raw
-        norm.append((s, e, obj))
-    for s, e, obj in norm:
         if not isinstance(obj, dict):
             continue
         name = obj.get("name") or (obj.get("function") or {}).get("name")
-        args = obj.get("arguments", {})
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except Exception:
-                args = {}
+        args = _as_args(obj)
         if name and isinstance(args, dict):
-            stripped = (text[:s] + text[e:]).strip()
-            stripped = (
-                stripped.replace("```json", "")
-                .replace("```", "")
-                .replace("<tool_call>", "")
-                .replace("</tool_call>", "")
-                .strip()
-            )
-            return {"name": name, "arguments": args}, stripped
-    return None, text
+            found.append((s, e, name, args))
+
+    # Убираем дубли: один и тот же объект может попасть и через явный
+    # regex (fenced/<tool_call>), и через общий поиск _extract_json_objects.
+    seen = set()
+    unique = []
+    for s, e, n, a in found:
+        if (s, e) in seen:
+            continue
+        seen.add((s, e))
+        unique.append((s, e, n, a))
+    found = unique
+
+    if found:
+        stripped = text
+        for s, e, _, _ in sorted(found, key=lambda x: x[0], reverse=True):
+            stripped = stripped[:s] + stripped[e:]
+        stripped = (
+            stripped.replace("```json", "")
+            .replace("```", "")
+            .replace("<tool_call>", "")
+            .replace("</tool_call>", "")
+            .strip()
+        )
+        calls = [{"name": n, "arguments": a} for _, _, n, a in found]
+        return calls, stripped
+
+    # FALLBACK: сломанный fenced-JSON — name и arguments по отдельности.
+    m_name = re.search(r'"name"\s*:\s*"([^"]*)"', text)
+    if m_name:
+        name = m_name.group(1)
+        m_arg = re.search(r'arguments\s*"?\s*:\s*', text)
+        if m_arg:
+            rest = text[m_arg.end():].lstrip()
+            args = None
+            if rest.startswith("{"):
+                objs = _extract_json_objects(rest)
+                if objs and isinstance(objs[0][2], dict):
+                    args = objs[0][2]
+            elif rest.startswith('"'):
+                m_str = re.match(r'("(?:\\.|[^"\\])*")', rest)
+                if m_str:
+                    try:
+                        args = json.loads(m_str.group(1))
+                        if isinstance(args, str):
+                            args = json.loads(args)
+                    except Exception:
+                        args = None
+            if isinstance(args, dict):
+                return [{"name": name, "arguments": args}], text
+    return [], text
 
 
 def _save_images_to_tmp(message: ChatMessage) -> List[str]:
@@ -524,7 +577,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 # (без текста и без вызова инструмента), повторяем с подсказкой
                 # «ответь текстом», чтобы клиент не зависал и получал итог.
                 final_text = ""
-                final_tool_call = None
+                final_tool_calls = []
                 completion_tokens = 0
                 reasoning_tokens = 0
                 attempt = 0
@@ -563,16 +616,16 @@ async def chat_completions(request: ChatCompletionRequest):
                         yield _sse_chunk({"error": {"message": f"Внутренняя ошибка: {exc}", "type": "server_error"}})
                         return
 
-                    # Разбор вызова инструмента (если клиент передал tools).
-                    tool_call = None
+                    # Разбор вызовов инструмента (если клиент передал tools).
+                    tool_calls = []
                     if request.tools and acc_text:
                         parsed, stripped = _parse_tool_call(acc_text, request.tools)
                         if parsed:
-                            tool_call = parsed
+                            tool_calls = parsed
                             acc_text = stripped
 
-                    if acc_text or tool_call:
-                        final_text, final_tool_call = acc_text, tool_call
+                    if acc_text or tool_calls:
+                        final_text, final_tool_calls = acc_text, tool_calls
                         completion_tokens = comp_tok
                         break
                     # Пустой ответ — повторяем с подсказкой, иначе заглушка.
@@ -592,19 +645,22 @@ async def chat_completions(request: ChatCompletionRequest):
                     except Exception:
                         citations = []
 
-                if final_tool_call:
+                if final_tool_calls:
                     # Чанк с вызовом инструмента (совместимо с OpenAI SDK):
                     # сначала delta с tool_calls (finish_reason=null), затем пустой
-                    # чанк с finish_reason="tool_calls".
+                    # чанк с finish_reason="tool_calls". Поддерживаем несколько
+                    # параллельных вызовов (каждый со своим index/id).
+                    tc_delta = [
+                        {"index": i, "id": f"call_{uuid.uuid4().hex[:12]}", "type": "function",
+                         "function": {"name": tc["name"],
+                                      "arguments": json.dumps(tc["arguments"], ensure_ascii=False)}}
+                        for i, tc in enumerate(final_tool_calls)
+                    ]
                     yield _sse_chunk({
                         "id": chat_id, "object": "chat.completion.chunk",
                         "created": created, "model": request.model,
                         "conversation_id": conv_id,
-                        "choices": [{"index": 0, "delta": {"tool_calls": [
-                            {"index": 0, "id": f"call_{uuid.uuid4().hex[:12]}", "type": "function",
-                             "function": {"name": final_tool_call["name"],
-                                          "arguments": json.dumps(final_tool_call["arguments"], ensure_ascii=False)}}
-                        ]}, "finish_reason": None}],
+                        "choices": [{"index": 0, "delta": {"tool_calls": tc_delta}, "finish_reason": None}],
                     })
                     yield _sse_chunk({
                         "id": chat_id, "object": "chat.completion.chunk",
@@ -664,8 +720,8 @@ async def chat_completions(request: ChatCompletionRequest):
                         rreason += delta
                     else:
                         rtext += delta
-                # Разбор вызова инструмента (если клиент передал tools).
-                parsed = None
+                # Разбор вызовов инструмента (если клиент передал tools).
+                parsed = []
                 if request.tools and rtext:
                     parsed, stripped = _parse_tool_call(rtext, request.tools)
                     if parsed:
@@ -674,10 +730,13 @@ async def chat_completions(request: ChatCompletionRequest):
                     response_text = rtext
                     reasoning_text = rreason
                     if parsed:
-                        tool_calls_obj = [ToolCall(function=ToolCallFunction(
-                            name=parsed["name"],
-                            arguments=json.dumps(parsed["arguments"], ensure_ascii=False),
-                        ))]
+                        tool_calls_obj = [
+                            ToolCall(function=ToolCallFunction(
+                                name=tc["name"],
+                                arguments=json.dumps(tc["arguments"], ensure_ascii=False),
+                            ))
+                            for tc in parsed
+                        ]
                     break
                 # Пустой ответ — повторяем с подсказкой, иначе заглушка.
                 attempt += 1
