@@ -29,6 +29,23 @@ OpenAI-совместимого клиента: поддерживаются р�
   остальные получают `HTTP 429` (настраивается `REQUEST_QUEUE_TIMEOUT`).
 - Сессия шифруется (Fernet) и сохраняется в `data/sessions.sqlite3`;
   восстанавливается автоматически при перезапуске.
+- **Мультимодальный `content`**: помимо строки поддерживается массив
+  content-частей OpenAI (`[{"type":"text","text":...}, {"type":"image_url",...}]`);
+  text-части склеиваются, `image_url`/`image_base64` передаются как вложения.
+- **Очистка ответов**: код-блоки возвращаются корректными markdown-заборами
+  (```lang ... ```), без «шапки» и подписей кнопок «Копировать»/«Скачать».
+- **Ошибки в формате OpenAI**: при сбоях отдаётся `{"error":{"message":...,"type":...}}`
+  (а не «Type validation failed» у zod-клиентов вроде AI SDK).
+- **Function calling (`tools` / `tool_calls`)**: мост переводит запросы DeepSeek в
+  стандартные `tool_calls` OpenAI. Клиент (opencode / Kilo Code) сам исполняет
+  команды и чтение файлов на вашей машине, получает результат и шлёт обратно
+  `tool`-сообщение — мост подсовывает его DeepSeek. Подробнее ниже.
+- **Режимы памяти `MEMORY_MODE`** (в `.env`):
+  - `server` (по умолчанию) — контекст держит сам DeepSeek (его чат-тред),
+    шлём только последнее сообщение.
+  - `client` — клиент шлёт всю историю; мост «сплющивает» её в одно сообщение
+    и каждый запрос начинает **новый** чат DeepSeek (полностью stateless,
+    без утечки прошлых ответов). НУЖЕН для opencode / Kilo Code.
 
 ## Установка
 
@@ -101,6 +118,11 @@ curl http://localhost:8000/v1/chat/completions \
 - `new_chat` (bool) — начать новый чат перед отправкой.
 - `conversation_id` — идентификатор чата для продолжения (из предыдущего ответа).
 - `images` в `messages[]` — вложения (`image_base64` / `image_path`).
+- `tools` — список инструментов в формате OpenAI
+  (`[{"type":"function","function":{"name":...,"description":...,"parameters":...}}]`).
+  Включает режим function calling (см. ниже).
+- `messages[].role` также допускает `"tool"` (результат вызова инструмента) и
+  `tool_calls` у сообщений `assistant`.
 
 В ответе (кроме стандартных полей) возвращаются:
 
@@ -108,6 +130,82 @@ curl http://localhost:8000/v1/chat/completions \
 - `conversation_id` — id чата DeepSeek.
 - `citations` — веб-цитаты (при Web-Search).
 - `usage.ds_token_counter` — счётчик токенов UI DeepSeek (если доступен).
+
+## Tool calling (function calling)
+
+Мост делает DeepSeek совместимым с агентскими клиентами (opencode, Kilo Code,
+Cursor и др.), которые сами исполняют инструменты. Реализован **шим** над
+чат-UI DeepSeek, который не имеет нативного function calling:
+
+1. Клиент шлёт запрос с `tools` (список инструментов OpenAI-формата).
+2. Мост вшивает в промпт инструкцию: DeepSeek должен вернуть вызов инструмента
+   одним fenced-JSON блоком:
+   ```` ```json
+   {"name": "<имя_инструмента>", "arguments": { ... }}
+   ``` ````
+3. Мост парсит этот блок и возвращает клиенту стандартный OpenAI `tool_calls`
+   (поле `choices[].message.tool_calls`, `finish_reason: "tool_calls"`; в потоке —
+   в финальном SSE-чанке).
+4. Клиент **сам выполняет** команду / читает файл на вашей машине, получает
+   результат и шлёт его обратно в `messages` с `role: "tool"`.
+5. Мост подсовывает результат DeepSeek, и цикл повторяется, пока модель не
+   вернёт финальный ответ.
+
+Пример запроса:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "tools": [
+      {"type":"function","function":{"name":"read_file","description":"Прочитать файл",
+       "parameters":{"type":"object","properties":{"path":{"type":"string"}}}}},
+      {"type":"function","function":{"name":"run_command","description":"Выполнить команду",
+       "parameters":{"type":"object","properties":{"command":{"type":"string"}}}}}
+    ],
+    "messages": [{"role":"user","content":"Прочитай README.md и скажи первую строку."}]
+  }'
+```
+
+Пример ответа (DeepSeek решила вызвать инструмент):
+
+```json
+{
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_abc123",
+        "type": "function",
+        "function": {"name": "read_file", "arguments": "{\"path\": \"README.md\"}"}
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}
+```
+
+Особенности:
+
+- Работает в обоих режимах `MEMORY_MODE`. Для opencode / Kilo Code ставьте
+  `MEMORY_MODE=client` (каждый запрос — новый чат, вся история в `messages`).
+- Если DeepSeek отвечает обычным текстом вместо JSON-блока вызова — `tool_calls`
+  не возвращаются, ответ идёт как есть (без краха).
+- Потоковый режим: `tool_calls` отдаются в финальном SSE-чанке
+  (`finish_reason: "tool_calls"`), контент до вызова не дублируется.
+
+## Режимы памяти (MEMORY_MODE)
+
+- `server` (по умолчанию в `.env.example`) — контекст хранит сам DeepSeek.
+  Мост отправляет только последнее сообщение в текущий чат-тред; предыдущие
+  реплики «помнит» DeepSeek. Хорошо для простых однопоточных клиентов.
+- `client` — клиент сам управляет историей и шлёт её целиком в `messages`.
+  Мост «сплющивает» историю в одно сообщение и стартует новый чат DeepSeek при
+  каждом запросе. Это полностью stateless и исключает утечку текста прошлых
+  ответов в новый — именно так ожидают вести себя opencode / Kilo Code.
 
 ## API-эндпоинты
 
@@ -201,8 +299,9 @@ curl http://localhost:8000/v1/chat/completions \
 
 - 🔜 **Аутентификация на стороне сервиса**
   Bearer-токен / API-key для защиты эндпоинтов при публичном доступе.
-- 🔜 **Эмуляция tool_calls / function calling**
-  Преобразование ответов DeepSeek в вызовы инструментов OpenAI-формата.
+- ✅ **Эмуляция tool_calls / function calling**
+  Шим над чат-UI DeepSeek: инструкция модели → fenced-JSON вызов → стандартные
+  `tool_calls` OpenAI-формата (клиент исполняет команды/чтение файлов сам).
 - 🔜 **Логирование запросов и квоты**
   Учёт токенов/запросов по ключам пользователей, лимиты.
 - 🔜 **Webhook при завершении длинной генерации**
