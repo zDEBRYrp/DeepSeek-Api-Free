@@ -210,6 +210,51 @@ def _cmd_to_toolcall(body: str, tool_names: set):
     return None
 
 
+def _canonical_call(call: dict) -> tuple:
+    """Каноническое представление вызова для сравнения (ловим перевызовы)."""
+    try:
+        args = call.get("arguments") or {}
+        if isinstance(args, str):
+            args = _safe_json_loads(args) or {}
+        s = json.dumps(args, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        s = ""
+    return (call.get("name"), s)
+
+
+def _executed_calls(messages) -> set:
+    """Множество уже исполненных вызовов: assistant.tool_calls, по которым есть
+    сообщение-результат (role='tool'). Нужно, чтобы разорвать цикл перевызовов."""
+    has_result = any(getattr(m, "role", None) == "tool" for m in messages)
+    if not has_result:
+        return set()
+    executed = set()
+    for m in messages:
+        if getattr(m, "role", None) == "assistant" and getattr(m, "tool_calls", None):
+            for tc in m.tool_calls:
+                f = tc.function
+                executed.add(_canonical_call({"name": f.name, "arguments": f.arguments}))
+    return executed
+
+
+def _last_tool_result(messages) -> Optional[str]:
+    for m in reversed(messages):
+        if getattr(m, "role", None) == "tool":
+            c = m.content
+            return c if isinstance(c, str) else ""
+    return None
+
+
+def _prune_loop_calls(parsed: list, messages) -> tuple:
+    """Отсеивает вызовы, уже исполненные в этой же беседе (цикл перевызовов).
+    Возвращает (отфильтрованный_список, флаг_что_все_были_циклом)."""
+    executed = _executed_calls(messages)
+    if not executed:
+        return parsed, False
+    filtered = [c for c in parsed if _canonical_call(c) not in executed]
+    return filtered, (bool(parsed) and not filtered)
+
+
 def _parse_tool_call(text: str, tools: Optional[List[Tool]]):
     """Ищет в ответе DeepSeek вызовы инструмента. Возвращает
     (list[dict{name, arguments(dict)}], очищенный_текст). Пустой список = нет вызовов.
@@ -301,10 +346,11 @@ def _parse_tool_call(text: str, tools: Optional[List[Tool]]):
                 return [{"name": name, "arguments": args}], text
 
     # FALLBACK 2: пользователь просит «писать команды через ```» — DeepSeek выдаёт
-    # их как текстовый code-блок (или псевдокоманду вроде `glob -p "**/*"`), а не
-    # как tool_call. Чтобы клиент реально выполнил команду, превращаем такой блок
-    # в вызов инструмента (glob/bash). Срабатывает, только если нужный инструмент
-    # есть в списке и блок не является JSON.
+    # их как текстовый code-блок (напр. `glob -p "**/*"`), а не как tool_call.
+    # Чтобы клиент реально выполнил команду, превращаем такой блок в вызов
+    # инструмента (glob/bash). Только для ```-блоков — голый текст не трогаем,
+    # иначе развёрнутые описания вроде «glob pattern * - path C:\...» превращаются
+    # в мусорные вызовы и уводят клиента в бесконечный цикл перевызовов.
     tool_names = {t.get("function", {}).get("name") for t in tools}
     if tool_names & {"bash", "glob"}:
         m_block = re.search(r"```(\w*)\n(.*?)\n```", text, re.DOTALL)
@@ -319,11 +365,6 @@ def _parse_tool_call(text: str, tools: Optional[List[Tool]]):
                     if call:
                         stripped = (text[:m_block.start()] + text[m_block.end():]).strip()
                         return [call], stripped
-        # голая псевдокоманда без заборов (напр. весь ответ — «glob -p "**/*"»)
-        if not text.lstrip().startswith("{") and _looks_like_command(text.strip()) and len(text.strip()) < 200:
-            call = _cmd_to_toolcall(text.strip(), tool_names)
-            if call:
-                return [call], ""
     return [], text
 
 
@@ -681,8 +722,17 @@ async def chat_completions(request: ChatCompletionRequest):
                     if request.tools and acc_text:
                         parsed, stripped = _parse_tool_call(acc_text, request.tools)
                         if parsed:
-                            tool_calls = parsed
-                            acc_text = stripped
+                            parsed, looped_all = _prune_loop_calls(parsed, request.messages)
+                            if looped_all:
+                                # Модель перевыпускает уже исполненный вызов — цикл.
+                                # Разрываем его: отдаём последний результат инструмента
+                                # как финальный текст, без tool_calls.
+                                last_res = _last_tool_result(request.messages)
+                                acc_text = last_res or "Результат выполнения команды получен (см. выше)."
+                                tool_calls = []
+                            else:
+                                tool_calls = parsed
+                                acc_text = stripped
 
                     if acc_text or tool_calls:
                         final_text, final_tool_calls = acc_text, tool_calls
@@ -797,7 +847,15 @@ async def chat_completions(request: ChatCompletionRequest):
                 if request.tools and rtext:
                     parsed, stripped = _parse_tool_call(rtext, request.tools)
                     if parsed:
-                        rtext = stripped
+                        parsed, looped_all = _prune_loop_calls(parsed, request.messages)
+                        if looped_all:
+                            # Модель перевыпускает уже исполненный вызов — цикл.
+                            # Разрываем: отдаём последний результат как текст.
+                            last_res = _last_tool_result(request.messages)
+                            rtext = last_res or "Результат выполнения команды получен (см. выше)."
+                            parsed = []
+                        else:
+                            rtext = stripped
                 if rtext or parsed:
                     response_text = rtext
                     reasoning_text = rreason
