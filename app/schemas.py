@@ -16,6 +16,22 @@ class ImagePart(BaseModel):
     value: str
 
 
+class ToolCallFunction(BaseModel):
+    name: str
+    arguments: str  # JSON-строка с аргументами
+
+
+class ToolCall(BaseModel):
+    id: str = Field(default_factory=lambda: f"call_{uuid.uuid4().hex[:12]}")
+    type: str = "function"
+    function: ToolCallFunction
+
+
+class Tool(BaseModel):
+    type: str = "function"
+    function: Dict[str, Any]  # {name, description, parameters}
+
+
 def _image_part_from_url(url: str) -> Dict[str, str]:
     """Конвертирует URL/Data-URI изображения в формат ImagePart."""
     if url.startswith("data:image"):
@@ -27,11 +43,15 @@ def _image_part_from_url(url: str) -> Dict[str, str]:
 
 
 class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
+    role: Literal["system", "user", "assistant", "tool"]
     # OpenAI-совместимо: content может быть строкой ИЛИ списком content-частей
     # (multimodal: [{"type":"text","text":...}, {"type":"image_url","image_url":{...}}]).
     content: Union[str, List[Dict[str, Any]]] = ""
     images: Optional[List[ImagePart]] = None
+    # Для role="assistant" с вызовом инструмента (function calling).
+    tool_calls: Optional[List[ToolCall]] = None
+    # Для role="tool" - id вызова, к которому относится результат (опционально).
+    tool_call_id: Optional[str] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -73,6 +93,7 @@ class ChatCompletionRequest(BaseModel):
     messages: Optional[List[ChatMessage]] = None
     stream: bool = False
     temperature: Optional[float] = None  # не используется UI, оставлено для совместимости
+    tools: Optional[List[Tool]] = None  # function calling (OpenAI-формат)
 
     # Служебные расширения
     deep_think: bool = False
@@ -85,8 +106,9 @@ class ChatCompletionRequest(BaseModel):
 
 class ChoiceMessage(BaseModel):
     role: str = "assistant"
-    content: str
+    content: Optional[str] = None
     reasoning_content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
 
 
 class Choice(BaseModel):

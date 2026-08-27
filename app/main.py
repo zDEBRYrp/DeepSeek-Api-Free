@@ -7,11 +7,12 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -25,6 +26,9 @@ from app.schemas import (
     ChatSwitchRequest,
     Choice,
     ChoiceMessage,
+    Tool,
+    ToolCall,
+    ToolCallFunction,
     Usage,
 )
 from app.search_client import search_web
@@ -64,6 +68,82 @@ def _extract_last_user_message(messages: List[ChatMessage]) -> ChatMessage:
         if msg.role == "user":
             return msg
     raise HTTPException(status_code=400, detail="В запросе отсутствует сообщение пользователя.")
+
+
+def _last_significant_message(messages: List[ChatMessage]) -> Optional[ChatMessage]:
+    """Последнее осмысленное сообщение для отправки в DeepSeek: user или tool
+    (результат инструмента тоже отправляем как сообщение)."""
+    for msg in reversed(messages):
+        if msg.role in ("user", "tool"):
+            return msg
+    return None
+
+
+def _flatten_conversation(messages: List[ChatMessage]) -> str:
+    """В режиме MEMORY_MODE=client вся история «сплющивается» в один промпт."""
+    parts: List[str] = []
+    for m in messages:
+        if m.role == "system":
+            continue
+        text = m.content if isinstance(m.content, str) else ""
+        if m.role == "user":
+            parts.append(f"[user]\n{text}")
+        elif m.role == "assistant":
+            if m.tool_calls:
+                for tc in m.tool_calls:
+                    parts.append(f"[assistant -> вызов инструмента {tc.function.name}]\n{tc.function.arguments}")
+            else:
+                parts.append(f"[assistant]\n{text}")
+        elif m.role == "tool":
+            parts.append(f"[результат инструмента]\n{text}")
+    return "\n\n".join(parts)
+
+
+def _build_tool_instruction(tools: Optional[List[Tool]]) -> str:
+    """Инструкция для DeepSeek, как оформлять вызов инструментов."""
+    if not tools:
+        return ""
+    lines = [
+        "Тебе доступны инструменты. Если ты решаешь вызвать инструмент - ответь "
+        "ТОЛЬКО одним fenced JSON-блоком вида и больше ничего не пиши:",
+        "```json",
+        '{"name": "<имя_инструмента>", "arguments": { ... }}',
+        "```",
+        "Когда тебе вернут результат инструмента, продолжи помогать пользователю.",
+        "Доступные инструменты:",
+    ]
+    for t in tools:
+        f = t.function
+        lines.append(f"- {f.get('name')}: {f.get('description', '')}")
+    return "\n".join(lines)
+
+
+def _parse_tool_call(text: str, tools: Optional[List[Tool]]):
+    """Ищет в ответе DeepSeek вызов инструмента. Возвращает
+    (dict {name, arguments(dict)}, очищенный_текст) или (None, text)."""
+    if not tools:
+        return None, text
+    allowed = {t.function.get("name") for t in tools}
+    candidates = re.findall(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
+    candidates += re.findall(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL)
+    for c in candidates:
+        try:
+            obj = json.loads(c)
+        except Exception:
+            continue
+        name = obj.get("name") or (obj.get("function") or {}).get("name")
+        args = obj.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {}
+        if name and (name in allowed):
+            stripped = text.replace("```json\n" + c + "\n```", "").replace(
+                "<tool_call>" + c + "</tool_call>", ""
+            ).strip()
+            return {"name": name, "arguments": args}, stripped
+    return None, text
 
 
 def _save_images_to_tmp(message: ChatMessage) -> List[str]:
@@ -266,28 +346,60 @@ async def chat_completions(request: ChatCompletionRequest):
 
         # --- Обычная отправка нового сообщения ---
         else:
-            last_message = _extract_last_user_message(request.messages)
-            prompt = last_message.content
-
-            # Системный промпт (если передан в messages, role=system) вшиваем
-            # прямо в текст сообщения, т.к. UI DeepSeek не имеет отдельного поля.
+            tools = request.tools
             system_msgs = [m for m in request.messages if m.role == "system"]
-            if system_msgs:
-                prompt = settings.SYSTEM_PROMPT_TEMPLATE.format(
-                    system=system_msgs[-1].content, user=prompt
-                )
+            system_text = system_msgs[-1].content if system_msgs else ""
+            last_user = _extract_last_user_message(request.messages)
+            mode = settings.MEMORY_MODE
 
-            file_paths = _save_images_to_tmp(last_message)
-            if request.new_chat:
+            if mode == "client":
+                # Клиент сам шлёт всю историю: сплющиваем её в ОДИН промпт и
+                # каждый раз начинаем НОВЫЙ чат DeepSeek (полностью stateless,
+                # без утечки прошлых ответов). Так работают opencode/Kilo Code.
+                conv = _flatten_conversation(request.messages)
+                tool_instr = _build_tool_instruction(tools) if tools else ""
+                sys_part = system_text
+                if tool_instr:
+                    sys_part = (sys_part + "\n\n" + tool_instr).strip() if sys_part else tool_instr
+                prompt = settings.SYSTEM_PROMPT_TEMPLATE.format(system=sys_part, user=conv) if sys_part else conv
+                file_paths = _save_images_to_tmp(last_user)
+                # В client-режиме ВСЕГДА новый чат (каждый запрос независим).
                 await browser_session.new_chat()
-            async for kind, delta in browser_session.stream_message(
-                prompt,
-                file_paths,
-                deep_think=eff_deep_think,
-                search=eff_search,
-                chat_id=request.conversation_id,
-            ):
-                yield kind, delta
+                async for kind, delta in browser_session.stream_message(
+                    prompt,
+                    file_paths,
+                    deep_think=eff_deep_think,
+                    search=eff_search,
+                    chat_id=None,
+                ):
+                    yield kind, delta
+            else:
+                # server-режим: отправляем последнее сообщение (user или
+                # результат инструмента) в существующий чат-тред DeepSeek.
+                last = _last_significant_message(request.messages)
+                tool_instr = _build_tool_instruction(tools) if tools else ""
+                if last and last.role == "tool":
+                    prompt = "[результат вызова инструмента]\n" + (last.content if isinstance(last.content, str) else "")
+                    if tool_instr:
+                        prompt = settings.SYSTEM_PROMPT_TEMPLATE.format(system=tool_instr, user=prompt)
+                else:
+                    prompt = last_user.content if isinstance(last_user.content, str) else ""
+                    sys_part = system_text
+                    if tool_instr:
+                        sys_part = (sys_part + "\n\n" + tool_instr).strip() if sys_part else tool_instr
+                    if sys_part:
+                        prompt = settings.SYSTEM_PROMPT_TEMPLATE.format(system=sys_part, user=prompt)
+                file_paths = _save_images_to_tmp(last_user)
+                if request.new_chat:
+                    await browser_session.new_chat()
+                async for kind, delta in browser_session.stream_message(
+                    prompt,
+                    file_paths,
+                    deep_think=eff_deep_think,
+                    search=eff_search,
+                    chat_id=request.conversation_id,
+                ):
+                    yield kind, delta
 
     async def _finalize_usage(prompt_tokens: int, completion_tokens: int):
         ds_counter = None
@@ -321,23 +433,31 @@ async def chat_completions(request: ChatCompletionRequest):
                 })
                 completion_tokens = 0
                 reasoning_tokens = 0
+                acc_text = ""   # полный накопленный ответ (для разбора tool_calls)
+                acc_reason = ""
+                # При наличии tools не стримим по кусочкам, а копим полный ответ,
+                # чтобы корректно отдать tool_calls в финальном чанке.
+                stream_incremental = not request.tools
                 try:
                     async for kind, delta in _source():
                         if kind == "reasoning":
                             reasoning_tokens += _estimate_tokens(delta)
-                            field = "reasoning_content"
+                            acc_reason += delta
+                            if stream_incremental:
+                                yield _sse_chunk({
+                                    "id": chat_id, "object": "chat.completion.chunk",
+                                    "created": created, "model": request.model,
+                                    "choices": [{"index": 0, "delta": {"reasoning_content": delta}, "finish_reason": None}],
+                                })
                         else:
                             completion_tokens += _estimate_tokens(delta)
-                            field = "content"
-                        yield _sse_chunk({
-                            "id": chat_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": request.model,
-                            "choices": [
-                                {"index": 0, "delta": {field: delta}, "finish_reason": None}
-                            ],
-                        })
+                            acc_text += delta
+                            if stream_incremental:
+                                yield _sse_chunk({
+                                    "id": chat_id, "object": "chat.completion.chunk",
+                                    "created": created, "model": request.model,
+                                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                                })
                 except BrowserSessionError as exc:
                     yield _sse_chunk({"error": {"message": str(exc), "type": "server_error"}})
                     return
@@ -345,6 +465,14 @@ async def chat_completions(request: ChatCompletionRequest):
                     logger.exception("Ошибка потоковой генерации")
                     yield _sse_chunk({"error": {"message": f"Внутренняя ошибка: {exc}", "type": "server_error"}})
                     return
+
+                # Разбор вызова инструмента (если клиент передал tools).
+                tool_call = None
+                if request.tools:
+                    parsed, stripped = _parse_tool_call(acc_text, request.tools)
+                    if parsed:
+                        tool_call = parsed
+                        acc_text = stripped
 
                 total_tokens, ds_counter = await _finalize_usage(
                     prompt_tokens, completion_tokens
@@ -356,21 +484,40 @@ async def chat_completions(request: ChatCompletionRequest):
                         citations = await browser_session.extract_citations()
                     except Exception:
                         citations = []
-                # Финальный чанк с завершением.
-                yield _sse_chunk({
-                    "id": chat_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": request.model,
-                    "conversation_id": conv_id,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                    "usage": {
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": total_tokens,
-                        "ds_token_counter": ds_counter,
-                    },
-                    **({"citations": citations} if citations else {}),
+
+                if tool_call:
+                    # Чанк с вызовом инструмента.
+                    yield _sse_chunk({
+                        "id": chat_id, "object": "chat.completion.chunk",
+                        "created": created, "model": request.model,
+                        "conversation_id": conv_id,
+                        "choices": [{"index": 0, "delta": {"tool_calls": [
+                            {"index": 0, "id": f"call_{uuid.uuid4().hex[:12]}", "type": "function",
+                             "function": {"name": tool_call["name"],
+                                          "arguments": json.dumps(tool_call["arguments"], ensure_ascii=False)}}
+                        ]}, "finish_reason": "tool_calls"}],
+                        "usage": {
+                            "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                            "total_tokens": total_tokens, "ds_token_counter": ds_counter,
+                        },
+                        **({"citations": citations} if citations else {}),
+                    })
+                else:
+                    # Финальный чанк с завершением (обычный ответ).
+                    yield _sse_chunk({
+                        "id": chat_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": request.model,
+                        "conversation_id": conv_id,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": total_tokens,
+                            "ds_token_counter": ds_counter,
+                        },
+                        **({"citations": citations} if citations else {}),
                 })
                 yield "data: [DONE]\n\n"
             finally:
@@ -405,8 +552,19 @@ async def chat_completions(request: ChatCompletionRequest):
         except BrowserSessionError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except Exception as exc:  # непредвиденная ошибка UI-автоматизации
-            logger.exception("Ошибка обработки запроса")
+            logger.exception("Ошиброобработки запроса")
             raise HTTPException(status_code=500, detail=f"Внутренняя ошибка: {exc}") from exc
+
+        # Разбор вызова инструмента (если клиент передал tools).
+        tool_calls_obj = None
+        if request.tools:
+            parsed, stripped = _parse_tool_call(response_text, request.tools)
+            if parsed:
+                tool_calls_obj = [ToolCall(function=ToolCallFunction(
+                    name=parsed["name"],
+                    arguments=json.dumps(parsed["arguments"], ensure_ascii=False),
+                ))]
+                response_text = stripped
 
         prompt_tokens = sum(_estimate_tokens(m.content) for m in (request.messages or []))
         completion_tokens = _estimate_tokens(response_text)
@@ -422,9 +580,14 @@ async def chat_completions(request: ChatCompletionRequest):
 
         return ChatCompletionResponse(
             model=request.model,
-            choices=[Choice(message=ChoiceMessage(
-                content=response_text, reasoning_content=reasoning_text or None
-            ))],
+            choices=[Choice(
+                message=ChoiceMessage(
+                    content=response_text if response_text else None,
+                    reasoning_content=reasoning_text or None,
+                    tool_calls=tool_calls_obj,
+                ),
+                finish_reason="tool_calls" if tool_calls_obj else "stop",
+            )],
             usage=Usage(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,

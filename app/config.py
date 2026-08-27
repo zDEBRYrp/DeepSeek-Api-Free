@@ -74,6 +74,14 @@ class Settings:
     # Максимальная длина одного сообщения (символов). 0 = без ограничения
     # (DeepSeek сам обрабатывает очень длинные вставки, преобразуя их в .txt-вложение).
     MAX_MESSAGE_LENGTH: int = int(os.getenv("MAX_MESSAGE_LENGTH", "0"))
+
+    # --- Режим памяти ---
+    # "server" - контекст держит сам DeepSeek (один чат-тред, отправляем только
+    #            последнее сообщение). Хорошо для простых клиентов и как дефолт в .env.example.
+    # "client" - клиент сам шлёт всю историю; мост «сплющивает» её в ОДНО сообщение
+    #            и каждый запрос начинает НОВЫЙ чат DeepSeek. Полностью stateless,
+    #            нет утечки прошлых ответов. Нужен для opencode/Kilo Code.
+    MEMORY_MODE: str = os.getenv("MEMORY_MODE", "server").strip().lower()
     MAX_FILES_PER_MESSAGE: int = int(os.getenv("MAX_FILES_PER_MESSAGE", "5"))
     MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "2"))
 
