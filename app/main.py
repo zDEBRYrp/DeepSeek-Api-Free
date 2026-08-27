@@ -257,6 +257,32 @@ def _prune_loop_calls(parsed: list, messages) -> tuple:
     return filtered, (bool(parsed) and not filtered)
 
 
+def _tool_names(tools: Optional[List[Tool]]) -> set:
+    """Имена инструментов, устойчиво к тому, что tools могут быть как dict
+    (сырой JSON запроса), так и объектами Tool (после валидации pydantic)."""
+    names: set = set()
+    for t in tools or []:
+        fn = t.get("function") if isinstance(t, dict) else getattr(t, "function", None)
+        if isinstance(fn, dict):
+            n = fn.get("name")
+        else:
+            n = getattr(fn, "name", None)
+        if n:
+            names.add(n)
+    return names
+
+
+def _safe_parse_tool_call(text: str, tools: Optional[List[Tool]]):
+    """Безопасная обёртка: любая ошибка разбора трактуется как 'без вызова
+    инструмента' (возвращаем текст как есть). Иначе падение внутри разбора
+    рвало SSE-поток и клиент получал обрыв соединения ('terminated')."""
+    try:
+        return _parse_tool_call(text, tools)
+    except Exception as exc:  # pragma: no cover - защита от падения потока
+        logging.getLogger("main").warning("Ошибка разбора tool_call: %s", exc)
+        return [], text
+
+
 def _parse_tool_call(text: str, tools: Optional[List[Tool]]):
     """Ищет в ответе DeepSeek вызовы инструмента. Возвращает
     (list[dict{name, arguments(dict)}], очищенный_текст). Пустой список = нет вызовов.
@@ -353,7 +379,7 @@ def _parse_tool_call(text: str, tools: Optional[List[Tool]]):
     # инструмента (glob/bash). Только для ```-блоков — голый текст не трогаем,
     # иначе развёрнутые описания вроде «glob pattern * - path C:\...» превращаются
     # в мусорные вызовы и уводят клиента в бесконечный цикл перевызовов.
-    tool_names = {t.get("function", {}).get("name") for t in tools}
+    tool_names = _tool_names(tools)
     if tool_names & {"bash", "glob"}:
         m_block = re.search(r"```(\w*)\n(.*?)\n```", text, re.DOTALL)
         if not m_block:
@@ -722,7 +748,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     # Разбор вызовов инструмента (если клиент передал tools).
                     tool_calls = []
                     if request.tools and acc_text:
-                        parsed, stripped = _parse_tool_call(acc_text, request.tools)
+                        parsed, stripped = _safe_parse_tool_call(acc_text, request.tools)
                         if parsed:
                             parsed, looped_all = _prune_loop_calls(parsed, request.messages)
                             if looped_all:
@@ -847,7 +873,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 # Разбор вызовов инструмента (если клиент передал tools).
                 parsed = []
                 if request.tools and rtext:
-                    parsed, stripped = _parse_tool_call(rtext, request.tools)
+                    parsed, stripped = _safe_parse_tool_call(rtext, request.tools)
                     if parsed:
                         parsed, looped_all = _prune_loop_calls(parsed, request.messages)
                         if looped_all:
