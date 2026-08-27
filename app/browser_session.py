@@ -598,6 +598,55 @@ class BrowserSession:
                   "share", "retry", "повторить", "edit", "редактировать", "delete", "удалить"]
         return any(lbl in low for lbl in labels)
 
+    # JS-извлечение контента без «шапок» code-блоков (язык + кнопки Копировать/Скачать).
+    # Код оборачивается в markdown-забор (```lang ... ```), а подписи кнопок не попадают в ответ.
+    EXTRACT_FN_SRC = r'''
+    function extractContent(el) {
+      if (!el) return '';
+      var pres = Array.from(el.querySelectorAll('pre'));
+      var fences = pres.map(function(pre) {
+        var lang = '';
+        var cur = pre.parentElement;
+        for (var i = 0; i < 4 && cur; i++) {
+          var hdr = cur.querySelector('[class*="header"], [class*="language"]');
+          if (hdr) { lang = (hdr.textContent || '').replace(/Копировать|Скачать|Copy|Download|поделиться|share/gi, ' ').trim().split(/\s+/)[0] || ''; break; }
+          cur = cur.parentElement;
+        }
+        if (!lang) { var sib = pre.previousElementSibling; if (sib) lang = (sib.textContent || '').replace(/Копировать|Скачать|Copy|Download/gi, ' ').trim().split(/\s+/)[0] || ''; }
+        var code = (pre.innerText || pre.textContent || '').replace(/\s+$/, '');
+        return '\n```' + lang + '\n' + code + '\n```\n';
+      });
+      var out = '';
+      function walk(node) {
+        if (node.nodeType === 3) { out += node.textContent; return; }
+        if (node.nodeType !== 1) return;
+        var tag = node.tagName.toLowerCase();
+        if (tag === 'button' || (node.getAttribute && node.getAttribute('role') === 'button')) return;
+        if (tag === 'pre') { var idx = pres.indexOf(node); out += (idx >= 0 ? fences[idx] : (node.innerText || '')); return; }
+        if (tag === 'br') { out += '\n'; return; }
+        if (node.children) {
+          var preKids = Array.from(node.children).filter(function(c){ return c.tagName.toLowerCase() === 'pre'; });
+          if (preKids.length) { preKids.forEach(function(pk){ var i = pres.indexOf(pk); out += (i >= 0 ? fences[i] : ''); }); return; }
+        }
+        var block = ['p','div','section','article','li','ul','ol','h1','h2','h3','h4','h5','h6','table','blockquote'].indexOf(tag) >= 0;
+        node.childNodes.forEach(function(ch){ walk(ch); });
+        if (block) out += '\n';
+      }
+      el.childNodes.forEach(function(ch){ walk(ch); });
+      return out.replace(/\n{3,}/g, '\n\n').trim();
+    }
+    '''
+    EXTRACT_CALL_JS = "(el) => { " + EXTRACT_FN_SRC + "\n return extractContent(el); }"
+
+    @staticmethod
+    def _looks_busy(text: str) -> bool:
+        """True, если извлечённый текст похож на сообщение DeepSeek 'сервис занят'."""
+        t = (text or "").lower().strip()
+        if not t:
+            return False
+        markers = ["сервис занят", "занят обработкой", "одновременно поддерживается", "повтор через"]
+        return any(m in t for m in markers) and len(t) < 600
+
     async def _extract_response_text(self, prompt: str = "") -> str:
         els = await self._page.query_selector_all(settings.SEL_ASSISTANT_BLOCK)
         if els:
@@ -606,15 +655,19 @@ class BrowserSession:
             candidates = []
             for el in els:
                 try:
-                    t = (await el.inner_text()).strip()
+                    t = (await el.evaluate(self.EXTRACT_CALL_JS)).strip()
                 except Exception:
-                    continue
+                    try:
+                        t = (await el.inner_text()).strip()
+                    except Exception:
+                        continue
                 if t:
                     candidates.append(t)
             if candidates:
                 text = candidates[-1]
                 if (settings.CHALLENGE_TEXT.lower() not in text.lower()
                         and not self._is_control_label(text)
+                        and not self._looks_busy(text)
                         and len(text) >= 5):
                     return text
             # блоки ассистента уже есть в DOM, но пока пусты -> ещё генерируется
@@ -662,7 +715,9 @@ class BrowserSession:
         reasoning и content внутри последней обёртки ассистента."""
         try:
             res = await self._page.evaluate(
-                """() => {
+                EXTRACT_FN_SRC
+                + """
+                () => {
                     const wrappers = Array.from(
                         document.querySelectorAll(
                             "div[class*='ds-message']:not([class*='main-content'])"
@@ -680,7 +735,7 @@ class BrowserSession:
                     const contentEl = last.querySelector(
                         "[class*='ds-assistant-message-main-content']"
                     );
-                    const content = contentEl ? contentEl.innerText.trim() : "";
+                    const content = contentEl ? extractContent(contentEl).trim() : "";
                     return {reasoning, content};
                 }"""
             )
@@ -689,6 +744,9 @@ class BrowserSession:
             if r and settings.CHALLENGE_TEXT.lower() in r.lower():
                 r = ""
             if c and settings.CHALLENGE_TEXT.lower() in c.lower():
+                c = ""
+            # Сообщение "сервис занят" не должно попадать в ответ - ждём реальный ответ.
+            if c and self._looks_busy(c):
                 c = ""
             return r, c
         except Exception:

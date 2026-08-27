@@ -397,6 +397,11 @@ async def chat_completions(request: ChatCompletionRequest):
                     reasoning_text += delta
                 else:
                     response_text += delta
+            if browser_session._looks_busy(response_text):
+                raise BrowserSessionError(
+                    "DeepSeek временно занят (одновременно обрабатывается только один запрос). "
+                    "Подождите несколько секунд и повторите запрос."
+                )
         except BrowserSessionError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except Exception as exc:  # непредвиденная ошибка UI-автоматизации
