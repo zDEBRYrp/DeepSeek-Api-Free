@@ -58,8 +58,10 @@ async def _acquire_or_429() -> None:
         )
 
 
-def _estimate_tokens(text: str) -> int:
+def _estimate_tokens(text) -> int:
     # Приближённая оценка (реальный токенайзер UI-модели недоступен)
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
     return max(1, len(text) // 4)
 
 

@@ -46,7 +46,9 @@ class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
     # OpenAI-совместимо: content может быть строкой ИЛИ списком content-частей
     # (multimodal: [{"type":"text","text":...}, {"type":"image_url","image_url":{...}}]).
-    content: Union[str, List[Dict[str, Any]]] = ""
+    # Допускаем None: по спецификации OpenAI assistant-сообщение с tool_calls имеет
+    # content=null (именно так шлёт OpenCode/Kilo Code).
+    content: Optional[Union[str, List[Dict[str, Any]]]] = None
     images: Optional[List[ImagePart]] = None
     # Для role="assistant" с вызовом инструмента (function calling).
     tool_calls: Optional[List[ToolCall]] = None
