@@ -1,0 +1,22 @@
+version: "3.9"
+
+services:
+  chat-ui-bridge:
+    build: .
+    container_name: chat-ui-bridge
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/srv/data
+      - ./pw_profile:/srv/pw_profile
+      - ./.env:/srv/.env
+    # Для первичного ручного логина (HEADLESS=false) может понадобиться
+    # проброс X11 (Linux-хост):
+    # environment:
+    #   - DISPLAY=${DISPLAY}
+    # volumes:
+    #   - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    shm_size: "1gb"

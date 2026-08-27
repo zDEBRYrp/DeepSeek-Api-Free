@@ -1,0 +1,45 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- Виртуальное окружение ---
+.venv/
+venv/
+env/
+
+# --- Секреты и учётные данные (НЕ КОММИТИТЬ) ---
+.env
+.env.local
+*.sqlite3
+data/
+pw_profile/
+pw_profile_test/
+
+# --- Cookies / сессии браузера ---
+cookies.txt
+*.cookie
+
+# --- Логи и временные файлы ---
+*.log
+server*.log
+server*.err
+debug_*.html
+request_tmp.json
+chat_upload_*/
+DeepSeek - Into the Unknown_files/
+
+# --- Сборки / кэши ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+Thumbs.db
+
+# --- IDE ---
+.idea/
+.vscode/
+*.swp
