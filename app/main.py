@@ -136,10 +136,11 @@ def _build_tool_instruction(tools: Optional[List[Tool]]) -> str:
         "ВАЖНО: если в строковом аргументе нужны кавычки (путь с пробелами), "
         "экранируй их обратным слэшем либо используй одинарные кавычки '...' — "
         "иначе JSON-вызов будет невалидным и инструмент не выполнится.",
-        f"ВАЖНО: проект расположен в директории {work_dir}. При работе с файлами и "
-        f"командами ВСЕГДА используй АБСОЛЮТНЫЕ пути внутри неё (например, "
-        f'ls "{work_dir}"), чтобы результат не зависел от текущей папки, из которой '
-        f"запущен клиент (она может отличаться от проекта).",
+        f"ВАЖНО: рабочая директория задаётся клиентом (см. 'Working directory' / "
+        f"environment details выше). Относительные команды вроде просто 'ls' "
+        f"исполняются относительно НЕЁ — этого обычно достаточно. Абсолютные пути "
+        f"тоже принимаются и надёжнее. (Резервный каталог сервера, если клиент не "
+        f"передал cwd: {work_dir}.)",
         "ВАЖНО: если пользователь просит писать команды в markdown-заборах (```), "
         "всё равно используй формат вызова инструмента выше — клиент сам отобразит и "
         "выполнит команду, а просто написанный текст НЕ выполняется.",
@@ -321,6 +322,57 @@ def _last_tool_result(messages) -> Optional[str]:
             c = m.content
             return c if isinstance(c, str) else ""
     return None
+
+
+# Клиенты (Kilo Code, OpenCode) часто вкладывают рабочую директорию проекта в
+# системный промпт (напр. "Working directory: C:\Users\zdebr\Desktop\Majestic API").
+# Вытаскиваем её, чтобы bash-вызовы модели исполнялись в проекте, а не в cwd
+# самого клиента (откуда он запущен). Эвристика: ключевое слово + абсолютный путь.
+_CLIENT_CWD_RE = re.compile(
+    r"(?:working\s*directory|workspace\s*(?:root\s*folder)?|current\s*directory|\bcwd\b)"
+    r"\s*[:=]?\s*['\"]?(?P<path>[A-Za-z]:\\[^\r\n'\"<>|]+|/[^\r\n'\"<>|]+)",
+    re.IGNORECASE,
+)
+
+
+def _extract_client_cwd(messages) -> Optional[str]:
+    if not messages:
+        return None
+    for m in messages:
+        if getattr(m, "role", None) != "system":
+            continue
+        c = getattr(m, "content", None)
+        text = ""
+        if isinstance(c, str):
+            text = c
+        elif isinstance(c, list):
+            text = "\n".join(
+                p.get("text", "") for p in c
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        if not text:
+            continue
+        m = _CLIENT_CWD_RE.search(text)
+        if m:
+            return m.group("path").rstrip("\\/")
+    return None
+
+
+def _anchor_tool_cwd(tool_calls: list, cwd: Optional[str]) -> list:
+    """Подставляет `cd` в рабочую директорию клиента к bash-вызовам, чтобы команда
+    исполнялась в проекте вне зависимости от cwd клиента и от того, указал ли модель
+    путь. Если в команде уже есть абсолютный путь — cd избыточен, но безвреден."""
+    if not cwd:
+        return tool_calls
+    for tc in tool_calls:
+        if tc.get("name") == "bash":
+            args = tc.get("arguments")
+            if not isinstance(args, dict):
+                continue
+            cmd = args.get("command")
+            if isinstance(cmd, str) and cmd.strip():
+                args["command"] = f'cd "{cwd}" && {cmd}'
+    return tool_calls
 
 
 def _prune_loop_calls(parsed: list, messages) -> tuple:
@@ -826,6 +878,9 @@ async def chat_completions(request: ChatCompletionRequest):
                     if request.tools and acc_text:
                         parsed, stripped = _safe_parse_tool_call(acc_text, request.tools)
                         if parsed:
+                            parsed = _anchor_tool_cwd(
+                                parsed, _extract_client_cwd(request.messages)
+                            )
                             parsed, looped_all = _prune_loop_calls(parsed, request.messages)
                             if looped_all:
                                 # Модель перевыпускает уже исполненный вызов — цикл.
@@ -959,6 +1014,9 @@ async def chat_completions(request: ChatCompletionRequest):
                 if request.tools and rtext:
                     parsed, stripped = _safe_parse_tool_call(rtext, request.tools)
                     if parsed:
+                        parsed = _anchor_tool_cwd(
+                            parsed, _extract_client_cwd(request.messages)
+                        )
                         parsed, looped_all = _prune_loop_calls(parsed, request.messages)
                         if looped_all:
                             # Модель перевыпускает уже исполненный вызов — цикл.
