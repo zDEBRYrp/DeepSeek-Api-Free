@@ -136,11 +136,9 @@ def _build_tool_instruction(tools: Optional[List[Tool]]) -> str:
         "ВАЖНО: если в строковом аргументе нужны кавычки (путь с пробелами), "
         "экранируй их обратным слэшем либо используй одинарные кавычки '...' — "
         "иначе JSON-вызов будет невалидным и инструмент не выполнится.",
-        f"ВАЖНО: рабочая директория задаётся клиентом (см. 'Working directory' / "
-        f"environment details выше). Относительные команды вроде просто 'ls' "
-        f"исполняются относительно НЕЁ — этого обычно достаточно. Абсолютные пути "
-        f"тоже принимаются и надёжнее. (Резервный каталог сервера, если клиент не "
-        f"передал cwd: {work_dir}.)",
+        f"ВАЖНО: команды исполняются в рабочей директории проекта (WORK_DIR сервера: "
+        f"{work_dir}). Достаточно относительной команды вроде просто 'ls' — мост "
+        f"сам выполнит её в этой папке. Абсолютные пути тоже принимаются.",
         "ВАЖНО: если пользователь просит писать команды в markdown-заборах (```), "
         "всё равно используй формат вызова инструмента выше — клиент сам отобразит и "
         "выполнит команду, а просто написанный текст НЕ выполняется.",
@@ -879,7 +877,7 @@ async def chat_completions(request: ChatCompletionRequest):
                         parsed, stripped = _safe_parse_tool_call(acc_text, request.tools)
                         if parsed:
                             parsed = _anchor_tool_cwd(
-                                parsed, _extract_client_cwd(request.messages)
+                                parsed, settings.WORK_DIR or _extract_client_cwd(request.messages)
                             )
                             parsed, looped_all = _prune_loop_calls(parsed, request.messages)
                             if looped_all:
@@ -1015,7 +1013,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     parsed, stripped = _safe_parse_tool_call(rtext, request.tools)
                     if parsed:
                         parsed = _anchor_tool_cwd(
-                            parsed, _extract_client_cwd(request.messages)
+                            parsed, settings.WORK_DIR or _extract_client_cwd(request.messages)
                         )
                         parsed, looped_all = _prune_loop_calls(parsed, request.messages)
                         if looped_all:
