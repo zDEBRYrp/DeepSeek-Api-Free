@@ -359,7 +359,8 @@ def _extract_client_cwd(messages) -> Optional[str]:
 def _anchor_tool_cwd(tool_calls: list, cwd: Optional[str]) -> list:
     """Подставляет `cd` в рабочую директорию клиента к bash-вызовам, чтобы команда
     исполнялась в проекте вне зависимости от cwd клиента и от того, указал ли модель
-    путь. Если в команде уже есть абсолютный путь — cd избыточен, но безвреден."""
+    путь. Перенос строки между `cd` и командой — универсальный разделитель операторов
+    (работает в PowerShell 5.1, cmd и bash); `&&` не подходит, т.к. в PS 5.1 его нет."""
     if not cwd:
         return tool_calls
     for tc in tool_calls:
@@ -369,7 +370,7 @@ def _anchor_tool_cwd(tool_calls: list, cwd: Optional[str]) -> list:
                 continue
             cmd = args.get("command")
             if isinstance(cmd, str) and cmd.strip():
-                args["command"] = f'cd "{cwd}" && {cmd}'
+                args["command"] = f'cd "{cwd}"\n{cmd}'
     return tool_calls
 
 
