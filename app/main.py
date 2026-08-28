@@ -130,6 +130,9 @@ def _build_tool_instruction(tools: Optional[List[Tool]]) -> str:
         "инструмента завершится с ошибкой. Рабочую директорию задаёт сам клиент.",
         "Если для выполнения нужна папка, включи путь прямо в строку команды "
         "(например, 'cd \"C:\\Путь\" ; Get-ChildItem').",
+        "ВАЖНО: если в строковом аргументе нужны кавычки (путь с пробелами), "
+        "экранируй их обратным слэшем либо используй одинарные кавычки '...' — "
+        "иначе JSON-вызов будет невалидным и инструмент не выполнится.",
         f"ВАЖНО: проект расположен в директории {work_dir}. При работе с файлами и "
         f"командами ВСЕГДА используй АБСОЛЮТНЫЕ пути внутри неё (например, "
         f'ls "{work_dir}"), чтобы результат не зависел от текущей папки, из которой '
@@ -149,6 +152,54 @@ def _build_tool_instruction(tools: Optional[List[Tool]]) -> str:
     return "\n".join(lines)
 
 
+def _fix_unescaped_quotes(s: str) -> str:
+    """Чинит неэкранированные двойные кавычки внутри JSON-строк.
+
+    DeepSeek часто пишет shell-пути в кавычках: "C:\\Users\\.." — это ломает
+    JSON, и вызов инструмента не парсится. Кавычку считаем ЗАКРЫВАЮЩЕЙ строку,
+    только если сразу за ней (после пробелов) идёт один из разделителей
+    , } ] : иначе экранируем её как литерал (\\")."""
+    out = []
+    in_string = False
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if in_string:
+            if c == "\\":
+                out.append(c)
+                if i + 1 < n:
+                    out.append(s[i + 1])
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if c == '"':
+                j = i + 1
+                while j < n and s[j] in " \t\r\n":
+                    j += 1
+                nxt = s[j] if j < n else ""
+                if nxt in ",}:]":
+                    out.append(c)
+                    in_string = False
+                else:
+                    out.append('\\"')
+                i += 1
+                continue
+            out.append(c)
+            i += 1
+            continue
+        if c == '"':
+            out.append(c)
+            in_string = True
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+        continue
+    return "".join(out)
+
+
 def _safe_json_loads(s: str):
     """json.loads с ремонтом: DeepSeek иногда вставляет внутрь JSON служебные
     символы — закрывающие ``` заборы и реальные переносы строк внутри строковых
@@ -166,6 +217,9 @@ def _safe_json_loads(s: str):
     # одиночный обратный слэш, который не стоит перед валидным escape-символом.
     t = re.sub(r'(?<!\\)\\(?!["\\/bfnrtu])', r'\\\\', t)
     t = re.sub(r'"([^"]*?)\s*"\s*:', r'"\1":', t)
+    # ремонт неэкранированных двойных кавычек внутри строковых значений
+    # (модель пишет shell-пути в кавычках: "C:\Users\.." — ломает JSON).
+    t = _fix_unescaped_quotes(t)
     try:
         return json.loads(t)
     except Exception:
