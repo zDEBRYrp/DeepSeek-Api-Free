@@ -1,11 +1,9 @@
 """
-Сжатие длинного диалога внешним LLM (по мотивам notion2api/app/summarizer.py).
+Сжатие длинного диалога внешним LLM.
 
-Отличия в лучшую сторону:
-- провайдер настраивается (любой OpenAI-совместимый endpoint), а не зашит
-  SiliconFlow: SUMMARIZER_API_URL / SUMMARIZER_API_KEY / SUMMARIZER_MODEL
-  (+ цепочка запасных моделей SUMMARIZER_MODEL_FALLBACKS);
-- цепочка fallback-моделей перебирается до первого успеха.
+Провайдер настраивается (любой OpenAI-совместимый endpoint):
+SUMMARIZER_API_URL / SUMMARIZER_API_KEY / SUMMARIZER_MODEL
+(+ цепочка запасных моделей SUMMARIZER_MODEL_FALLBACKS, перебор до успеха).
 """
 
 import logging

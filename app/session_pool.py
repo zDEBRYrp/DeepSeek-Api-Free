@@ -1,11 +1,9 @@
 """
 Пул браузерных сессий (профилей DeepSeek).
 
-Идея украдена у notion2api (app/account_pool.py), но реализована лучше:
-- asyncio-нативно (у них threading.Lock + time.sleep внутри лока — в async
-  сервере это блокировало бы event loop; здесь блокировок event loop нет);
-- единицей пула является живая BrowserSession, а не HTTP-клиент;
-- пул из 1 профиля ведёт себя в точности как раньше (zero behavior change).
+- asyncio-нативно: ожидание свободной сессии не блокирует event loop;
+- единицей пула является живая BrowserSession (или её вкладка shared-context);
+- пул из 1 профиля ведёт себя в точности как одиночная сессия.
 
 Профили задаются файлом profiles.json (рядом с .env) или переменной
 DS_PROFILES (JSON-массив):

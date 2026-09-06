@@ -44,7 +44,7 @@ logger = logging.getLogger("main")
 app = FastAPI(title="Internal Chat UI Bridge", version="1.0.0")
 _started_at = time.time()
 
-# CORS для локальных веб-клиентов (по мотивам notion2api).
+# CORS для локальных веб-клиентов.
 if settings.ALLOWED_ORIGINS:
     app.add_middleware(
         CORSMiddleware,
@@ -669,8 +669,8 @@ async def on_shutdown() -> None:
     await session_pool.close_all()
 
 
-# Мини Web UI (по мотивам Notion AI Studio у notion2api, но в одном файле
-# и поверх НАШЕГО API): чат, выбор режима, панель мышления, цитаты.
+# Мини Web UI (один файл поверх НАШЕГО API): чат, выбор режима,
+# панель мышления, цитаты.
 _UI_INDEX = Path(__file__).resolve().parent.parent / "frontend" / "index.html"
 
 

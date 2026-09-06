@@ -1,5 +1,5 @@
 """
-CLI для управления входом в DeepSeek (по мотивам notion2api login.py).
+CLI для управления входом в DeepSeek.
 
 Использование:
     python login.py                  # вход для профиля по умолчанию (USER_DATA_DIR)

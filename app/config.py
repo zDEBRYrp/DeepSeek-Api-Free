@@ -63,19 +63,19 @@ class Settings:
     # --- Сетевой сервис ---
     HOST: str = os.getenv("HOST", "0.0.0.0")
     PORT: int = int(os.getenv("PORT", "8000"))
-    # Bearer-токен для /v1/* (по мотивам notion2api API_KEY). Пусто = без проверки.
+    # Bearer-токен для /v1/*. Пусто = без проверки.
     API_KEY: str = os.getenv("API_KEY", "")
     # CORS для локальных веб-клиентов.
     ALLOWED_ORIGINS: list = [
         s.strip() for s in os.getenv("ALLOWED_ORIGINS", "").split(",") if s.strip()
     ]
 
-    # --- Rate limiting (по мотивам notion2api limiter.py, но без slowapi) ---
+    # --- Rate limiting (свой скользящий лимит, без внешних зависимостей) ---
     # Скользящее окно на POST /v1/chat/completions, на IP. 0 = без лимита.
     RATE_LIMIT_PER_MINUTE: int = int(os.getenv("RATE_LIMIT_PER_MINUTE", "25"))
     DISABLE_RATE_LIMIT: bool = os.getenv("DISABLE_RATE_LIMIT", "false").lower() == "true"
 
-    # --- Пул профилей (по мотивам notion2api account_pool.py) ---
+    # --- Пул профилей ---
     # profiles.json (рядом с .env) или DS_PROFILES (JSON). Пусто = один профиль
     # из USER_DATA_DIR/COOKIE_FILE. Формат:
     # [{"name":"acc1","user_data_dir":"./pw_profile_1","cookie_file":"./cookies1.txt"}]
@@ -89,7 +89,7 @@ class Settings:
     # Сколько секунд ждать освобождения профиля, прежде чем вернуть 429.
     POOL_MAX_WAIT_SECONDS: float = float(os.getenv("POOL_MAX_WAIT_SECONDS", "15"))
 
-    # --- Суммаризатор длинного контекста (по мотивам notion2api summarizer.py) ---
+    # --- Суммаризатор длинного контекста ---
     # Любой OpenAI-совместимый endpoint. Пусто = выключено (работает обрезка).
     SUMMARIZER_API_URL: str = os.getenv("SUMMARIZER_API_URL", "")
     SUMMARIZER_API_KEY: str = os.getenv("SUMMARIZER_API_KEY", "")
