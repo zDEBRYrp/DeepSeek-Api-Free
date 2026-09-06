@@ -1,0 +1,12 @@
+[
+  {
+    "name": "acc1",
+    "user_data_dir": "./pw_profile_1",
+    "cookie_file": "./cookies1.txt"
+  },
+  {
+    "name": "acc2",
+    "user_data_dir": "./pw_profile_2",
+    "cookie_file": "./cookies2.txt"
+  }
+]

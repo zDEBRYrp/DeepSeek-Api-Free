@@ -13,6 +13,8 @@ services:
       - ./data:/srv/data
       - ./pw_profile:/srv/pw_profile
       - ./.env:/srv/.env
+      # Пул профилей: обновляется без пересборки (restart достаточно).
+      - ./profiles.json:/srv/profiles.json:ro
     # Для первичного ручного логина (HEADLESS=false) может понадобиться
     # проброс X11 (Linux-хост):
     # environment:
@@ -20,3 +22,14 @@ services:
     # volumes:
     #   - /tmp/.X11-unix:/tmp/.X11-unix:rw
     shm_size: "1gb"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -46,6 +46,16 @@ OpenAI-совместимого клиента: поддерживаются р�
   - `client` — клиент шлёт всю историю; мост «сплющивает» её в одно сообщение
     и каждый запрос начинает **новый** чат DeepSeek (полностью stateless,
     без утечки прошлых ответов). НУЖЕН для opencode / Kilo Code.
+- **Пул профилей** (`profiles.json` / `DS_PROFILES`, пример: `profiles.json.example`):
+  round-robin по нескольким аккаунтам DeepSeek, упавший профиль уходит
+  в cooldown (`POOL_COOLDOWN_SECONDS`) и возвращается сам; статус — в `/healthz`.
+- **Защита**: `API_KEY` (Bearer для всех `/v1/*`), per-IP rate limit
+  (`RATE_LIMIT_PER_MINUTE`, `DISABLE_RATE_LIMIT`), CORS (`ALLOWED_ORIGINS`).
+- **Суммаризатор длинного контекста**: при настроенном `SUMMARIZER_API_URL`
+  (любой OpenAI-совместимый endpoint) середина истории длиннее
+  `SUMMARIZE_THRESHOLD_CHARS` сжимается внешним LLM с цепочкой запасных
+  моделей (`SUMMARIZER_MODEL` + `SUMMARIZER_MODEL_FALLBACKS`).
+- **CLI входа**: `python login.py [--profile NAME] [--check|--list|--manual]`.
 
 ## Установка
 
@@ -218,7 +228,7 @@ curl http://localhost:8000/v1/chat/completions \
 | GET  | `/v1/chat/history?chat_id=` | История сообщений чата |
 | POST | `/v1/chat/new` | Новый чат (возвращает `chat_id`) |
 | POST | `/v1/chat/stop` | Остановить текущую генерацию |
-| GET  | `/healthz` | Проверка живости |
+| GET  | `/healthz` | Проверка живости: `status`, `uptime`, `mode`, `pool` (профили), `version` |
 
 ## Важно
 

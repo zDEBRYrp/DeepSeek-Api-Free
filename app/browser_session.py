@@ -79,7 +79,10 @@ class BrowserSessionError(Exception):
 
 
 class BrowserSession:
-    def __init__(self):
+    def __init__(self, user_data_dir=None, cookie_file=None):
+        # Переопределения профиля для пула сессий (None = взять из settings).
+        self._user_data_dir = user_data_dir
+        self._cookie_file = cookie_file
         self._playwright = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
@@ -87,6 +90,15 @@ class BrowserSession:
         self._lock = asyncio.Lock()
         self._login_lock = asyncio.Lock()
         self._started = False
+
+    def bind_profile(self, user_data_dir=None, cookie_file=None) -> None:
+        """Привязать инстанс к профилю пула. Только до start()."""
+        if self._started:
+            raise RuntimeError("Нельзя менять профиль запущенной сессии.")
+        if user_data_dir:
+            self._user_data_dir = user_data_dir
+        if cookie_file:
+            self._cookie_file = cookie_file
 
     # ---------- Жизненный цикл ----------
 
@@ -103,11 +115,12 @@ class BrowserSession:
         if settings.USER_AGENT:
             context_kwargs["user_agent"] = settings.USER_AGENT
 
-        if settings.USER_DATA_DIR:
+        user_data_dir = self._user_data_dir if self._user_data_dir is not None else settings.USER_DATA_DIR
+        if user_data_dir:
             # Постоянный профиль: реальные (в т.ч. httpOnly) куки и хранилище
             # сохраняются на диске между перезапусками сервиса.
             self._context = await self._playwright.chromium.launch_persistent_context(
-                user_data_dir=settings.USER_DATA_DIR, **launch_kwargs, **context_kwargs
+                user_data_dir=user_data_dir, **launch_kwargs, **context_kwargs
             )
             self._browser = self._context.browser
         else:
@@ -330,7 +343,8 @@ class BrowserSession:
         return []
 
     async def _apply_cookie_file(self) -> bool:
-        path = Path(settings.COOKIE_FILE)
+        cookie_file = self._cookie_file if self._cookie_file is not None else settings.COOKIE_FILE
+        path = Path(cookie_file)
         if not path.exists():
             return False
         raw = path.read_text(encoding="utf-8")
@@ -411,13 +425,14 @@ class BrowserSession:
         logger.info("Сессия сохранена в зашифрованном хранилище.")
 
     async def _save_cookies_to_file(self) -> None:
+        cookie_file = self._cookie_file if self._cookie_file is not None else settings.COOKIE_FILE
         try:
             cookies = await self._context.cookies()
-            Path(settings.COOKIE_FILE).write_text(
+            Path(cookie_file).write_text(
                 json.dumps(cookies, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            logger.info("Все cookies (%d шт.) сохранены в %s", len(cookies), settings.COOKIE_FILE)
+            logger.info("Все cookies (%d шт.) сохранены в %s", len(cookies), cookie_file)
         except Exception as exc:
             logger.warning("Не удалось сохранить cookies в файл: %s", exc)
 
@@ -467,7 +482,8 @@ class BrowserSession:
             logger.warning("Не удалось проверить текущую сессию: %s", exc)
 
         # 2. Пробуем файл cookies.
-        if Path(settings.COOKIE_FILE).exists():
+        cookie_file = self._cookie_file if self._cookie_file is not None else settings.COOKIE_FILE
+        if Path(cookie_file).exists():
             try:
                 if await self._apply_cookie_file():
                     if await self._is_session_valid():

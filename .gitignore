@@ -55,3 +55,6 @@ server_hf.err
 body_plain.json
 resp_plain.txt
 resp_tool.txt
+
+# --- Сторонние референсы (не коммитить) ---
+vendor/

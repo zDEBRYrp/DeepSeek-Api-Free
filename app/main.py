@@ -14,10 +14,12 @@ import uuid
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app.browser_session import BrowserSessionError, browser_session
+from app import model_registry
+from app.browser_session import BrowserSession, BrowserSessionError, browser_session
 from app.config import settings
 from app.schemas import (
     ChatCompletionRequest,
@@ -32,11 +34,40 @@ from app.schemas import (
     Usage,
 )
 from app.search_client import search_web
+from app.security import SlidingWindowLimiter, install_security
+from app.session_pool import PoolExhaustedError, SessionPool
+from app.summarizer import SummarizerUnavailableError, summarize_text
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
 app = FastAPI(title="Internal Chat UI Bridge", version="1.0.0")
+_started_at = time.time()
+
+# CORS для локальных веб-клиентов (по мотивам notion2api).
+if settings.ALLOWED_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.ALLOWED_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+# Bearer-авторизация /v1/* + access-лог (пустой API_KEY = без проверки).
+install_security(app, api_key=settings.API_KEY)
+
+# Per-IP rate limit на генерацию (скользящее окно, без slowapi).
+RATE_LIMITER = SlidingWindowLimiter(
+    limit_per_minute=0 if settings.DISABLE_RATE_LIMIT else settings.RATE_LIMIT_PER_MINUTE
+)
+
+# Пул браузерных сессий (round-robin + cooldown). Наполняется в on_startup;
+# при одном профиле ведёт себя как legacy-синглтон.
+session_pool = SessionPool(
+    cooldown_seconds=settings.POOL_COOLDOWN_SECONDS,
+    max_wait_seconds=settings.POOL_MAX_WAIT_SECONDS,
+)
 
 # Очередь запросов: браузер один, поэтому одновременно обрабатываем только
 # один тяжёлый запрос (генерацию). Остальные получают 429 с небольшим
@@ -56,6 +87,63 @@ async def _acquire_or_429() -> None:
                    "Одновременно поддерживается только один запрос генерации.",
             headers={"Retry-After": "5"},
         )
+
+
+def _check_rate_limit(http_request: Request) -> None:
+    """Per-IP лимит на генерацию (скользящее окно)."""
+    if settings.DISABLE_RATE_LIMIT or RATE_LIMITER.limit <= 0:
+        return
+    ip = http_request.client.host if http_request.client else "unknown"
+    ok, retry_after = RATE_LIMITER.check(ip)
+    if not ok:
+        raise HTTPException(
+            status_code=429,
+            detail="Слишком много запросов, попробуйте позже.",
+            headers={"Retry-After": str(int(retry_after) + 1)},
+        )
+
+
+async def _pool_acquire_or_429():
+    """Сессия из пула профилей (round-robin, мимо cooling)."""
+    try:
+        return await session_pool.acquire()
+    except PoolExhaustedError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=str(exc),
+            headers={"Retry-After": str(exc.retry_after)},
+        )
+
+
+async def _maybe_summarize(conv: str) -> str:
+    """Сжать середину длинного диалога внешним LLM вместо обрезки.
+
+    Без настроенного SUMMARIZER_API_URL возвращает как есть.
+    При сбое суммаризатора — тоже как есть (поведение не хуже прежнего).
+    """
+    limit = settings.SUMMARIZE_THRESHOLD_CHARS
+    if not settings.SUMMARIZER_API_URL or len(conv) <= limit:
+        return conv
+    head_len, tail_len = 2000, max(2000, limit - 2000)
+    head, tail = conv[:head_len], conv[-tail_len:]
+    middle = conv[head_len:len(conv) - tail_len]
+    if not middle.strip():
+        return conv
+    try:
+        summary = await summarize_text(
+            middle,
+            api_url=settings.SUMMARIZER_API_URL,
+            api_key=settings.SUMMARIZER_API_KEY,
+            model=settings.SUMMARIZER_MODEL,
+            fallbacks=settings.SUMMARIZER_MODEL_FALLBACKS,
+        )
+    except SummarizerUnavailableError as exc:
+        logger.warning("Суммаризатор недоступен, шлём как есть: %s", exc)
+        return conv
+    return (
+        head + "\n\n[Сводка раннего диалога]:\n" + summary
+        + "\n\n[...продолжение диалога...]\n" + tail
+    )
 
 
 def _estimate_tokens(text) -> int:
@@ -551,18 +639,48 @@ def _save_images_to_tmp(message: ChatMessage) -> List[str]:
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    logger.info("Запуск браузерной сессии...")
-    await browser_session.start()
+    from app.session_pool import load_profiles
+
+    profiles = load_profiles(settings.USER_DATA_DIR, settings.COOKIE_FILE)
+    # Первый профиль обслуживает legacy-синглтон (его же используют
+    # остальные эндпоинты и debug).
+    p0 = profiles[0]
+    browser_session.bind_profile(
+        p0.user_data_dir or settings.USER_DATA_DIR,
+        p0.cookie_file or settings.COOKIE_FILE,
+    )
+    for p in profiles:
+        if p is p0:
+            session_pool.add(p.name, browser_session)
+        else:
+            session_pool.add(
+                p.name,
+                BrowserSession(
+                    user_data_dir=p.user_data_dir or settings.USER_DATA_DIR,
+                    cookie_file=p.cookie_file or settings.COOKIE_FILE,
+                ),
+            )
+    logger.info("Запуск пула сессий (%d шт.)...", len(session_pool))
+    await session_pool.start_all()
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
-    await browser_session.close()
+    await session_pool.close_all()
 
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok"}
+    pool = await session_pool.get_status_summary() if len(session_pool) else {
+        "total": 0, "active": 0, "cooling": 0, "profiles": []
+    }
+    return {
+        "status": "ok",
+        "uptime": int(time.time() - _started_at),
+        "mode": settings.MEMORY_MODE,
+        "pool": pool,
+        "version": app.version,
+    }
 
 
 @app.get("/debug/dump")
@@ -632,25 +750,8 @@ async def stop_generation():
 @app.get("/v1/models")
 async def list_models():
     """Список доступных «моделей» - режимов (think/search) обёртки.
-    Формируется из MODE_TOGGLES (единственный источник правды)."""
-    owned = "deepseek-chat"
-    descriptions = {
-        (False, False): "Обычный режим (без DeepThink и без поиска).",
-        (True, False): "DeepThink вкл, поиск выкл (аналог Reasoner).",
-        (False, True): "Web-поиск вкл, DeepThink выкл.",
-        (True, True): "DeepThink + Web-поиск одновременно.",
-    }
-    data = [
-        {
-            "id": name,
-            "object": "model",
-            "created": 0,
-            "owned_by": owned,
-            "description": descriptions.get(flags, "Режим DeepSeek."),
-        }
-        for name, flags in settings.MODE_TOGGLES.items()
-    ]
-    return {"object": "list", "data": data}
+    Формируется из model_registry + MODE_TOGGLES (единственный источник правды)."""
+    return {"object": "list", "data": model_registry.list_models(settings.MODE_TOGGLES)}
 
 
 @app.get("/debug/extract")
@@ -700,23 +801,36 @@ MAX_EMPTY_RETRIES = 2
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
+async def chat_completions(request: ChatCompletionRequest, http_request: Request):
     # Обычная отправка требует поле messages.
     if not request.regenerate and request.edit is None and not request.messages:
         raise HTTPException(
             status_code=400, detail="Поле 'messages' обязательно для отправки сообщения."
         )
 
+    # Per-IP лимит — до захвата слота, чтобы не держать очередь зря.
+    _check_rate_limit(http_request)
+
     # Захват слота очереди (или 429, если сервис уже занят генерацией).
     await _acquire_or_429()
+
+    # Сессия из пула профилей (при одном профиле это legacy-синглтон).
+    # При исчерпании пула слот очереди возвращаем, иначе deadlock.
+    try:
+        sess = await _pool_acquire_or_429()
+    except HTTPException:
+        REQUEST_SEM.release()
+        raise
 
     # Маппинг model -> режим (Deepseek-Think / Search / Think_Search).
     # Если model распознан - он имеет приоритет над флагами deep_think/search.
     eff_deep_think = request.deep_think
     eff_search = request.search
     model_key = (request.model or "").strip().lower()
-    if model_key in settings.MODE_TOGGLES:
-        eff_deep_think, eff_search = settings.MODE_TOGGLES[model_key]
+    if model_registry.is_supported_model(model_key, settings.MODE_TOGGLES):
+        eff_deep_think, eff_search = model_registry.resolve_toggles(
+            model_key, settings.MODE_TOGGLES
+        )
 
     # Определяем источник приращений (kind, delta) в зависимости от режима запроса.
     # kind in {'reasoning','content'} - рассуждения DeepThink и итоговый ответ.
@@ -728,14 +842,14 @@ async def chat_completions(request: ChatCompletionRequest):
             msgs = list(msgs) + [ChatMessage(role="user", content=EMPTY_ANSWER_NUDGE)]
         # --- Регенерация последнего ответа ---
         if request.regenerate:
-            async for kind, delta in browser_session.regenerate_stream(
+            async for kind, delta in sess.regenerate_stream(
                 chat_id=request.conversation_id
             ):
                 yield kind, delta
 
         # --- Редактирование сообщения из истории с пересчётом ---
         elif request.edit is not None:
-            async for kind, delta in browser_session.edit_stream(
+            async for kind, delta in sess.edit_stream(
                 request.edit.index, request.edit.content,
                 chat_id=request.conversation_id,
             ):
@@ -753,7 +867,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 # Клиент сам шлёт всю историю: сплющиваем её в ОДИН промпт и
                 # каждый раз начинаем НОВЫЙ чат DeepSeek (полностью stateless,
                 # без утечки прошлых ответов). Так работают opencode/Kilo Code.
-                conv = _flatten_conversation(msgs)
+                conv = await _maybe_summarize(_flatten_conversation(msgs))
                 tool_instr = _build_tool_instruction(tools) if tools else ""
                 sys_part = system_text
                 if tool_instr:
@@ -761,8 +875,8 @@ async def chat_completions(request: ChatCompletionRequest):
                 prompt = settings.SYSTEM_PROMPT_TEMPLATE.format(system=sys_part, user=conv) if sys_part else conv
                 file_paths = _save_images_to_tmp(last_user)
                 # В client-режиме ВСЕГДА новый чат (каждый запрос независим).
-                await browser_session.new_chat()
-                async for kind, delta in browser_session.stream_message(
+                await sess.new_chat()
+                async for kind, delta in sess.stream_message(
                     prompt,
                     file_paths,
                     deep_think=eff_deep_think,
@@ -788,8 +902,8 @@ async def chat_completions(request: ChatCompletionRequest):
                         prompt = settings.SYSTEM_PROMPT_TEMPLATE.format(system=sys_part, user=prompt)
                 file_paths = _save_images_to_tmp(last_user)
                 if request.new_chat:
-                    await browser_session.new_chat()
-                async for kind, delta in browser_session.stream_message(
+                    await sess.new_chat()
+                async for kind, delta in sess.stream_message(
                     prompt,
                     file_paths,
                     deep_think=eff_deep_think,
@@ -801,7 +915,7 @@ async def chat_completions(request: ChatCompletionRequest):
     async def _finalize_usage(prompt_tokens: int, completion_tokens: int):
         ds_counter = None
         try:
-            tc = await browser_session.extract_token_counts()
+            tc = await sess.extract_token_counts()
             if tc:
                 ds_counter = f"{tc[0]}/{tc[1]}"
                 # Реальный счётчик UI (если есть) уточняет общее число токенов.
@@ -865,6 +979,7 @@ async def chat_completions(request: ChatCompletionRequest):
                                         "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
                                     })
                     except BrowserSessionError as exc:
+                        await session_pool.mark_failed(sess)
                         yield _sse_chunk({"error": {"message": str(exc), "type": "server_error"}})
                         return
                     except Exception as exc:
@@ -905,11 +1020,11 @@ async def chat_completions(request: ChatCompletionRequest):
                 total_tokens, ds_counter = await _finalize_usage(
                     prompt_tokens, completion_tokens
                 )
-                conv_id = await browser_session.get_current_chat_id()
+                conv_id = await sess.get_current_chat_id()
                 citations = []
                 if eff_search:
                     try:
-                        citations = await browser_session.extract_citations()
+                        citations = await sess.extract_citations()
                     except Exception:
                         citations = []
 
@@ -981,6 +1096,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 yield "data: [DONE]\n\n"
             finally:
                 # Потоковый режим освобождает слот сам, по завершении генерации.
+                await session_pool.release(sess)
                 REQUEST_SEM.release()
 
         return StreamingResponse(
@@ -1043,12 +1159,13 @@ async def chat_completions(request: ChatCompletionRequest):
                     response_text = EMPTY_ANSWER_FALLBACK
                     break
 
-            if tool_calls_obj is None and browser_session._looks_busy(response_text):
+            if tool_calls_obj is None and sess._looks_busy(response_text):
                 raise BrowserSessionError(
                     "DeepSeek временно занят (одновременно обрабатывается только один запрос). "
                     "Подождите несколько секунд и повторите запрос."
                 )
         except BrowserSessionError as exc:
+            await session_pool.mark_failed(sess)
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except Exception as exc:  # непредвиденная ошибка UI-автоматизации
             logger.exception("Ошиброобработки запроса")
@@ -1059,12 +1176,12 @@ async def chat_completions(request: ChatCompletionRequest):
         prompt_tokens = sum(_estimate_tokens(m.content) for m in (request.messages or []))
         completion_tokens = _estimate_tokens(response_text)
         total_tokens, ds_counter = await _finalize_usage(prompt_tokens, completion_tokens)
-        conv_id = await browser_session.get_current_chat_id()
+        conv_id = await sess.get_current_chat_id()
 
         citations = []
         if eff_search:
             try:
-                citations = await browser_session.extract_citations()
+                citations = await sess.extract_citations()
             except Exception:
                 citations = []
 
@@ -1107,3 +1224,11 @@ async def browser_error_handler(_, exc: BrowserSessionError):
 async def http_error_handler(_, exc: HTTPException):
     etype = "invalid_request_error" if exc.status_code == 400 else "server_error"
     return _openai_error(exc.status_code, str(exc.detail), etype)
+
+
+@app.exception_handler(Exception)
+async def unhandled_error_handler(request, exc: Exception):
+    logger.exception(
+        "Unhandled error: %s %s", request.method, request.url.path
+    )
+    return _openai_error(500, f"Внутренняя ошибка: {exc}", "server_error")
