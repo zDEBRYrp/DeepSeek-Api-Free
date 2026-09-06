@@ -49,6 +49,10 @@ OpenAI-совместимого клиента: поддерживаются р�
 - **Пул профилей** (`profiles.json` / `DS_PROFILES`, пример: `profiles.json.example`):
   round-robin по нескольким аккаунтам DeepSeek, упавший профиль уходит
   в cooldown (`POOL_COOLDOWN_SECONDS`) и возвращается сам; статус — в `/healthz`.
+  **Параллельность = размеру пула**: каждый запрос занимает свою сессию
+  («много вкладок»); один профиль = строго один запрос за раз, остальные ждут
+  `REQUEST_QUEUE_TIMEOUT` секунд и получают 429. Второй профиль = второй
+  параллельный запрос (залогинь через `python login.py --profile acc2`).
 - **Защита**: `API_KEY` (Bearer для всех `/v1/*`), per-IP rate limit
   (`RATE_LIMIT_PER_MINUTE`, `DISABLE_RATE_LIMIT`), CORS (`ALLOWED_ORIGINS`).
 - **Суммаризатор длинного контекста**: при настроенном `SUMMARIZER_API_URL`

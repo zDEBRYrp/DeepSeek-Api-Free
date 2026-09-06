@@ -69,24 +69,10 @@ session_pool = SessionPool(
     max_wait_seconds=settings.POOL_MAX_WAIT_SECONDS,
 )
 
-# Очередь запросов: браузер один, поэтому одновременно обрабатываем только
-# один тяжёлый запрос (генерацию). Остальные получают 429 с небольшим
-# "окном" ожидания, чтобы не блокировать клиента навсегда.
-REQUEST_SEM = asyncio.Lock()
+# Параллельность = размер пула профилей: каждый запрос занимает СВОЮ сессию
+# («много вкладок»). Один профиль = строго один запрос за раз, остальные ждут
+# свободной сессии REQUEST_QUEUE_TIMEOUT секунд и получают 429.
 REQUEST_QUEUE_TIMEOUT = float(os.getenv("REQUEST_QUEUE_TIMEOUT", "2.0"))
-
-
-async def _acquire_or_429() -> None:
-    """Захватывает слот выполнения или возвращает 429, если сервис занят."""
-    try:
-        await asyncio.wait_for(REQUEST_SEM.acquire(), timeout=REQUEST_QUEUE_TIMEOUT)
-    except asyncio.TimeoutError:
-        raise HTTPException(
-            status_code=429,
-            detail="Сервис занят обработкой другого запроса. "
-                   "Одновременно поддерживается только один запрос генерации.",
-            headers={"Retry-After": "5"},
-        )
 
 
 def _check_rate_limit(http_request: Request) -> None:
@@ -104,9 +90,9 @@ def _check_rate_limit(http_request: Request) -> None:
 
 
 async def _pool_acquire_or_429():
-    """Сессия из пула профилей (round-robin, мимо cooling)."""
+    """Свободная сессия из пула (или 429, если все заняты / в cooldown)."""
     try:
-        return await session_pool.acquire()
+        return await session_pool.acquire(timeout=REQUEST_QUEUE_TIMEOUT)
     except PoolExhaustedError as exc:
         raise HTTPException(
             status_code=429,
@@ -811,16 +797,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     # Per-IP лимит — до захвата слота, чтобы не держать очередь зря.
     _check_rate_limit(http_request)
 
-    # Захват слота очереди (или 429, если сервис уже занят генерацией).
-    await _acquire_or_429()
-
-    # Сессия из пула профилей (при одном профиле это legacy-синглтон).
-    # При исчерпании пула слот очереди возвращаем, иначе deadlock.
-    try:
-        sess = await _pool_acquire_or_429()
-    except HTTPException:
-        REQUEST_SEM.release()
-        raise
+    # Свободная сессия пула (при одном профиле — строго по очереди).
+    sess = await _pool_acquire_or_429()
 
     # Маппинг model -> режим (Deepseek-Think / Search / Think_Search).
     # Если model распознан - он имеет приоритет над флагами deep_think/search.
@@ -1097,7 +1075,6 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             finally:
                 # Потоковый режим освобождает слот сам, по завершении генерации.
                 await session_pool.release(sess)
-                REQUEST_SEM.release()
 
         return StreamingResponse(
             event_generator(),
@@ -1205,8 +1182,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             **({"citations": citations} if citations else {}),
         )
     finally:
-        # Непотоковый режим освобождает слот здесь, после формирования ответа.
-        REQUEST_SEM.release()
+        # Непотоковый режим возвращает сессию в пул здесь, после формирования ответа.
+        await session_pool.release(sess)
 
 
 def _openai_error(status: int, message: str, etype: str) -> JSONResponse:

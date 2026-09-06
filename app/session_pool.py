@@ -98,6 +98,7 @@ class SessionPool:
         self._names: List[str] = []
         self._sessions: list = []
         self._cooldown_until: List[float] = []
+        self._in_use: set = set()  # индексы сессий, занятых генерацией прямо сейчас
         self._index = 0
         self._lock = asyncio.Lock()
         self._default_cooldown = max(1.0, float(cooldown_seconds))
@@ -133,38 +134,46 @@ class SessionPool:
             except Exception as exc:
                 logger.warning("Ошибка закрытия профиля '%s': %s", name, exc)
 
-    async def acquire(self) -> object:
-        """Следующая доступная сессия (round-robin, пропуская cooling).
+    async def acquire(self, timeout: Optional[float] = None) -> object:
+        """Свободная сессия (round-robin, мимо cooling и занятых).
 
-        Если все в cooldown — ждём ближайшего освобождения (в пределах
-        max_wait_seconds), иначе PoolExhaustedError (-> HTTP 429).
+        Параллельность = размер пула: разные запросы получают разные сессии
+        («много вкладок»). Один профиль = строго последовательная работа.
+        timeout=None -> self._max_wait. Исчерпание -> PoolExhaustedError (429).
         """
         if not self._sessions:
             raise PoolExhaustedError(5)
-        deadline = time.time() + self._max_wait
+        limit = self._max_wait if timeout is None else max(0.0, float(timeout))
+        deadline = time.time() + limit
         while True:
             async with self._lock:
                 now = time.time()
-                start = self._index
                 for _ in range(len(self._sessions)):
                     idx = self._index
                     self._index = (self._index + 1) % len(self._sessions)
-                    if self._cooldown_until[idx] <= now:
+                    if idx not in self._in_use and self._cooldown_until[idx] <= now:
+                        self._in_use.add(idx)
                         return self._sessions[idx]
-                    if self._index == start:
-                        break
-                # Все в cooldown.
-                wait = min(self._cooldown_until) - now
-                if wait <= 0:
-                    continue
-                if time.time() + wait > deadline:
-                    raise PoolExhaustedError(retry_after=wait)
-            # Ждём ВНЕ лока, чтобы не стопать event loop другим корутинам.
-            await asyncio.sleep(min(wait, 1.0))
+                cools = [ts - now for ts in self._cooldown_until if ts > now]
+                min_cool = min(cools) if cools else 0.0
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise PoolExhaustedError(
+                    retry_after=min_cool if min_cool > 0 else 5
+                )
+            # Ждём ВНЕ лока: либо истечения ближайшего cooldown, либо
+            # освобождения занятой сессии (poll).
+            step = min_cool if min_cool > 0 else 0.25
+            await asyncio.sleep(max(0.05, min(step, remaining, 1.0)))
 
     async def release(self, session) -> None:
-        """Освобождение сессии (сейчас no-op; слот под будущие per-session лимиты)."""
-        return None
+        """Вернуть сессию в ротацию после завершения запроса."""
+        async with self._lock:
+            try:
+                idx = self._sessions.index(session)
+            except ValueError:
+                return
+            self._in_use.discard(idx)
 
     async def mark_failed(
         self, session, cooldown_seconds: Optional[float] = None
@@ -192,5 +201,6 @@ class SessionPool:
                 "total": len(self._sessions),
                 "active": active,
                 "cooling": len(self._sessions) - active,
+                "busy": len(self._in_use),
                 "profiles": list(self._names),
             }
