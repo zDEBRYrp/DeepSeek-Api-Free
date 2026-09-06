@@ -60,6 +60,10 @@ OpenAI-совместимого клиента: поддерживаются р�
   `SUMMARIZE_THRESHOLD_CHARS` сжимается внешним LLM с цепочкой запасных
   моделей (`SUMMARIZER_MODEL` + `SUMMARIZER_MODEL_FALLBACKS`).
 - **CLI входа**: `python login.py [--profile NAME] [--check|--list|--manual]`.
+- **Встроенный Web UI** (`GET /ui`, один файл `frontend/index.html`): чат поверх
+  нашего же `/v1/chat/completions` (stream), выбор режима из `/v1/models`,
+  раскрывающаяся панель мышления (`reasoning_content`), веб-цитаты,
+  чекбоксы think/search, поле API-ключа (помнится в localStorage).
 
 ## Установка
 
@@ -233,6 +237,7 @@ curl http://localhost:8000/v1/chat/completions \
 | POST | `/v1/chat/new` | Новый чат (возвращает `chat_id`) |
 | POST | `/v1/chat/stop` | Остановить текущую генерацию |
 | GET  | `/healthz` | Проверка живости: `status`, `uptime`, `mode`, `pool` (профили), `version` |
+| GET  | `/ui` | Встроенный Web UI (чат) |
 
 ## Важно
 

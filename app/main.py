@@ -16,7 +16,7 @@ from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app import model_registry
 from app.browser_session import BrowserSession, BrowserSessionError, browser_session
@@ -635,24 +635,50 @@ async def on_startup() -> None:
         p0.user_data_dir or settings.USER_DATA_DIR,
         p0.cookie_file or settings.COOKIE_FILE,
     )
+    owners = []
     for p in profiles:
         if p is p0:
             session_pool.add(p.name, browser_session)
+            owners.append((p, browser_session))
         else:
-            session_pool.add(
-                p.name,
-                BrowserSession(
-                    user_data_dir=p.user_data_dir or settings.USER_DATA_DIR,
-                    cookie_file=p.cookie_file or settings.COOKIE_FILE,
-                ),
+            owner = BrowserSession(
+                user_data_dir=p.user_data_dir or settings.USER_DATA_DIR,
+                cookie_file=p.cookie_file or settings.COOKIE_FILE,
             )
+            session_pool.add(p.name, owner)
+            owners.append((p, owner))
     logger.info("Запуск пула сессий (%d шт.)...", len(session_pool))
     await session_pool.start_all()
+    # Дополнительные вкладки — в том же Chromium/контексте владельца
+    # (без второго браузера). Только после старта владельцев: attach()
+    # требует живой контекст.
+    for p, owner in owners:
+        ntabs = p.tabs if p.tabs > 1 else settings.TABS_PER_PROFILE
+        for i in range(2, ntabs + 1):
+            try:
+                tab = await BrowserSession.attach(owner)
+                session_pool.add(f"{p.name}#tab{i}", tab)
+            except Exception as exc:
+                logger.warning("Не удалось открыть вкладку %d профиля '%s': %s",
+                               i, p.name, exc)
+    logger.info("Пул готов: всего сессий %d.", len(session_pool))
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     await session_pool.close_all()
+
+
+# Мини Web UI (по мотивам Notion AI Studio у notion2api, но в одном файле
+# и поверх НАШЕГО API): чат, выбор режима, панель мышления, цитаты.
+_UI_INDEX = Path(__file__).resolve().parent.parent / "frontend" / "index.html"
+
+
+@app.get("/ui", include_in_schema=False)
+async def web_ui():
+    if not _UI_INDEX.exists():
+        raise HTTPException(status_code=404, detail="Web UI не установлен.")
+    return FileResponse(_UI_INDEX, media_type="text/html")
 
 
 @app.get("/healthz")

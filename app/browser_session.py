@@ -90,6 +90,7 @@ class BrowserSession:
         self._lock = asyncio.Lock()
         self._login_lock = asyncio.Lock()
         self._started = False
+        self._attached = False  # True у вкладок shared-context (см. attach())
 
     def bind_profile(self, user_data_dir=None, cookie_file=None) -> None:
         """Привязать инстанс к профилю пула. Только до start()."""
@@ -143,9 +144,51 @@ class BrowserSession:
         self._page = await self._context.new_page()
         self._page.set_default_timeout(settings.get_timeout(settings.ACTION_TIMEOUT_MS))
         self._started = True
+        self._attached = False
         asyncio.create_task(self._safe_restore_or_login())
 
+    @classmethod
+    async def attach(cls, owner: "BrowserSession") -> "BrowserSession":
+        """Новая вкладка в ТОМ ЖЕ Chromium/контексте владельца (shared-context).
+
+        Зачем: второй `launch_persistent_context` на тот же user_data_dir
+        невозможен (лок каталога профиля) — иначе нужен второй процесс
+        Chromium. Вкладки делят куки/сессию аккаунта, но у каждой свой Page,
+        свои локи и свой чат: параллельные генерации без второго браузера.
+        Владелец делает login/restore один раз; вкладка только открывается.
+        """
+        if not owner._started or owner._context is None:
+            raise BrowserSessionError(
+                "Нельзя открыть вкладку: владелец ещё не стартовал."
+            )
+        tab = cls(
+            user_data_dir=owner._user_data_dir,
+            cookie_file=owner._cookie_file,
+        )
+        tab._playwright = owner._playwright  # чужое — не останавливать в close()
+        tab._browser = owner._browser
+        tab._context = owner._context  # общее — не закрывать в close()
+        tab._page = await owner._context.new_page()
+        tab._page.set_default_timeout(settings.get_timeout(settings.ACTION_TIMEOUT_MS))
+        try:
+            await tab._page.goto(settings.CHAT_URL, wait_until="domcontentloaded")
+        except Exception as exc:
+            logger.warning("Вкладка: не удалось открыть стартовую страницу: %s", exc)
+        tab._started = True
+        tab._attached = True
+        return tab
+
     async def close(self) -> None:
+        if getattr(self, "_attached", False):
+            # Вкладка: закрываем только свою страницу, общий контекст живёт.
+            try:
+                if self._page:
+                    await self._page.close()
+            except Exception:
+                pass
+            self._page = None
+            self._started = False
+            return
         if self._context:
             await self._context.close()
         elif self._browser:

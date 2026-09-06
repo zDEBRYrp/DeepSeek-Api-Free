@@ -39,6 +39,7 @@ class SessionProfile:
     name: str
     user_data_dir: str = ""
     cookie_file: str = ""
+    tabs: int = 1  # вкладок shared-context на этот профиль (>=1)
 
 
 def load_profiles(
@@ -75,6 +76,7 @@ def load_profiles(
                     name=str(item.get("name") or f"profile-{idx}"),
                     user_data_dir=str(item.get("user_data_dir") or ""),
                     cookie_file=str(item.get("cookie_file") or ""),
+                    tabs=max(1, int(item.get("tabs") or 1)),
                 )
             )
         return profiles
@@ -128,7 +130,9 @@ class SessionPool:
                 )
 
     async def close_all(self) -> None:
-        for name, sess in zip(self._names, self._sessions):
+        # В обратном порядке: сначала вкладки (только свои страницы),
+        # затем владельцы (контекст/браузер).
+        for name, sess in reversed(list(zip(self._names, self._sessions))):
             try:
                 await sess.close()
             except Exception as exc:

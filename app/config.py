@@ -80,6 +80,10 @@ class Settings:
     # из USER_DATA_DIR/COOKIE_FILE. Формат:
     # [{"name":"acc1","user_data_dir":"./pw_profile_1","cookie_file":"./cookies1.txt"}]
     PROFILES_FILE: str = os.getenv("PROFILES_FILE", "./profiles.json")
+    # Вкладок (параллельных генераций) на один профиль: все вкладки живут в
+    # ОДНОМ Chromium/контексте (shared-context), второй браузер не нужен.
+    # 1 = как раньше (одна вкладка). Перекрывается полем "tabs" записи профиля.
+    TABS_PER_PROFILE: int = max(1, int(os.getenv("TABS_PER_PROFILE", "1")))
     # Сколько секунд профиль отдыхает после сбоя, прежде чем вернуться в ротацию.
     POOL_COOLDOWN_SECONDS: float = float(os.getenv("POOL_COOLDOWN_SECONDS", "30"))
     # Сколько секунд ждать освобождения профиля, прежде чем вернуть 429.
