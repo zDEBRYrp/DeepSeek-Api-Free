@@ -125,6 +125,18 @@ class Settings:
     MAX_FILES_PER_MESSAGE: int = int(os.getenv("MAX_FILES_PER_MESSAGE", "5"))
     MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "2"))
 
+    # --- Retry при "Server busy" ---
+    # Макс. число повторных попыток при ответе DeepSeek «сервис занят».
+    # 0 = без повторов (сразу вернёт ошибку 502).
+    RETRY_MAX_ATTEMPTS: int = int(os.getenv("RETRY_MAX_ATTEMPTS", "3"))
+    # Базовая задержка перед первым повтором (мс). С каждымAttempt умножается
+    # на RETRY_BACKOFF_FACTOR (экспоненциальный backoff).
+    RETRY_BASE_DELAY_MS: int = int(os.getenv("RETRY_BASE_DELAY_MS", "3000"))
+    # Максимальная задержка между попытками (мс), «потолок» backoff.
+    RETRY_MAX_DELAY_MS: int = int(os.getenv("RETRY_MAX_DELAY_MS", "30000"))
+    # Множитель backoff: 1.5 = задержки 3с → 4.5с → 6.75с → ...
+    RETRY_BACKOFF_FACTOR: float = float(os.getenv("RETRY_BACKOFF_FACTOR", "1.5"))
+
     # --- CSS/Playwright-селекторы для https://chat.deepseek.com ---
     # Поле ввода сообщения
     SEL_MESSAGE_INPUT: str = os.getenv("SEL_MESSAGE_INPUT", "textarea")

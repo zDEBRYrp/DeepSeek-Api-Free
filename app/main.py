@@ -598,8 +598,11 @@ def _parse_tool_call(text: str, tools: Optional[List[Tool]]):
 
 
 def _save_images_to_tmp(message: ChatMessage) -> List[str]:
-    """Сохраняет base64-изображения во временные файлы для последующей загрузки в UI."""
+    """Готовит вложения к загрузке в UI: image_path, image_base64 и image_url
+    (http/https скачивается на стороне моста) -> локальные файлы."""
     import base64
+
+    import httpx
 
     paths: List[str] = []
     if not message.images:
@@ -608,18 +611,58 @@ def _save_images_to_tmp(message: ChatMessage) -> List[str]:
     tmp_dir = Path(tempfile.mkdtemp(prefix="chat_upload_"))
     for i, image in enumerate(message.images):
         if image.type == "image_path":
-            paths.append(image.value)
+            p = image.value
+            if p.startswith("file://"):
+                p = p[len("file://"):]
+            paths.append(p)
         elif image.type == "image_base64":
-            file_path = tmp_dir / f"image_{i}.png"
-            file_path.write_bytes(base64.b64decode(image.value))
+            raw = base64.b64decode(image.value)
+            if raw[:8] == b"\x89PNG\r\n\x1a\n":
+                ext = ".png"
+            elif raw[:2] == b"\xff\xd8":
+                ext = ".jpg"
+            elif raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+                ext = ".webp"
+            else:
+                ext = ".png"
+            file_path = tmp_dir / f"image_{i}{ext}"
+            file_path.write_bytes(raw)
             paths.append(str(file_path))
         elif image.type == "image_url":
-            # Загрузка по URL сознательно не выполняется здесь — рекомендуется
-            # заранее скачать файл на стороне клиента и передать image_path/base64.
-            raise HTTPException(
-                status_code=400,
-                detail="image_url не поддерживается напрямую, используйте image_base64 или image_path.",
-            )
+            url = image.value
+            if url.startswith("file://"):
+                paths.append(url[len("file://"):])
+            elif url.startswith(("http://", "https://")):
+                try:
+                    r = httpx.get(url, timeout=15.0, follow_redirects=True)
+                    r.raise_for_status()
+                    data = r.content
+                    if len(data) > 20 * 1024 * 1024:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Файл по URL больше 20 МБ.",
+                        )
+                    ct = r.headers.get("content-type", "")
+                    ext = ".png"
+                    if "jpeg" in ct or "jpg" in ct:
+                        ext = ".jpg"
+                    elif "webp" in ct:
+                        ext = ".webp"
+                    elif "gif" in ct:
+                        ext = ".gif"
+                    file_path = tmp_dir / f"url_{i}{ext}"
+                    file_path.write_bytes(data)
+                    paths.append(str(file_path))
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Не удалось скачать файл по URL: {exc}",
+                    )
+            else:
+                # Не URL — считаем локальным путём.
+                paths.append(url)
     return paths
 
 
@@ -766,6 +809,277 @@ async def list_models():
     return {"object": "list", "data": model_registry.list_models(settings.MODE_TOGGLES)}
 
 
+@app.get("/debug/attach_probe")
+async def debug_attach_probe():
+    """Диагностика загрузки файлов: какие input[type=file] есть в DOM, видимы ли,
+    есть ли превью-чипы и кнопки-скрепки."""
+    if not browser_session._page:
+        return {"ok": False, "reason": "no page"}
+    info = await browser_session._page.evaluate(
+        """() => {
+            const rect = (el) => { const b = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return {w: Math.round(b.width), h: Math.round(b.height),
+                        vis: s.visibility, disp: s.display}; };
+            const inputs = Array.from(document.querySelectorAll("input[type='file']"));
+            const clip = (el) => ((el.getAttribute('aria-label') || '') + '|' +
+                (el.textContent || '').slice(0, 30));
+            const btns = Array.from(
+                document.querySelectorAll("button, [role='button'], input[type='button']"));
+            return {
+                url: location.href,
+                file_inputs: inputs.map(el => Object.assign(
+                    {accept: el.accept || '', multiple: !!el.multiple,
+                     files: el.files ? el.files.length : -1}, rect(el))),
+                blob_imgs: document.querySelectorAll("img[src^='blob:']").length,
+                preview_like: document.querySelectorAll(
+                    "[class*='preview'], [class*='thumb']").length,
+                clip_like: btns.filter(b => /attach|upload|clip|скреп|прикрепи|загрузи|плюс|\\+/i
+                    .test(clip(b))).map(clip).slice(0, 10),
+            };
+        }"""
+    )
+    return {"ok": True, **info}
+
+
+@app.get("/debug/attach_send")
+async def debug_attach_send(file: str = ""):
+    """ВРЕМЕННЫЙ эксперимент: полный цикл на ГЛАВНОЙ (без new_chat):
+    attach -> ожидание аплоада -> текст -> send -> ответ модели."""
+    import tempfile as _tf
+
+    sess = browser_session
+    if not sess._page:
+        return {"ok": False, "reason": "no page"}
+    src = Path(file) if file else (Path(_tf.gettempdir()) / "ds_probe.png")
+    try:
+        await sess._page.goto("https://chat.deepseek.com/", wait_until="domcontentloaded")
+    except Exception as exc:
+        return {"ok": False, "reason": f"goto: {exc}"}
+    await asyncio.sleep(2)
+    # Гипотеза: файлы понимает только режим "Распознавание". Включаем таб
+    # с этим текстом до аттача (как живой пользователь).
+    try:
+        hit = await sess._page.evaluate(
+            """() => {
+                const all = Array.from(document.querySelectorAll('*'));
+                const el = all.find(e => (e.textContent || '').trim() === 'Распознавание');
+                if (!el) return 'no-tab';
+                el.click();
+                return 'clicked:' + el.tagName;
+            }"""
+        )
+    except Exception as exc:
+        hit = f"tab-fail: {exc}"
+    await asyncio.sleep(2)
+    try:
+        await sess._attach_files([str(src)])
+    except Exception as exc:
+        return {"ok": False, "stage": "attach", "mode_tab": hit, "reason": str(exc)[:300]}
+    baseline = await sess._submit_message("What exact text is on the attached image? Reply with the text only.")
+    _ = baseline
+    try:
+        reasoning, answer = await sess._wait_response_complete(
+            wait_new=True, prompt="attached image", baseline_text=baseline)
+    except Exception as exc:
+        return {"ok": False, "stage": "wait", "reason": str(exc)[:300]}
+    return {"ok": True, "answer": (answer or "")[:500]}
+
+
+@app.get("/debug/attach_try")
+async def debug_attach_try(file: str = "", primer: str = ""):
+    """Живой эксперимент: кладёт тестовый PNG в input[type=file] и возвращает,
+    что показал composer (files, blob-превью, кусок HTML композера).
+    primer=1: сначала отправляет '.' и ждёт ответ (репродукция E2E-состояния)."""
+    import tempfile as _tf
+
+    if not browser_session._page:
+        return {"ok": False, "reason": "no page"}
+    png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+        "0000000a49444154789c626001000000ffff0300000600050b02660000000049454e44ae426082"
+    )
+    probe = Path(file) if file else (Path(_tf.gettempdir()) / "ds_probe.png")
+    if not probe.exists():
+        probe.write_bytes(png)
+    await browser_session.ensure_logged_in()
+    primer_info = ""
+    if primer:
+        try:
+            base = await browser_session._submit_message(".")
+            await browser_session._wait_response_complete(
+                wait_new=True, prompt=".", baseline_text=base)
+            primer_info = "primer done"
+        except Exception as exc:
+            primer_info = f"primer fail: {exc}"[:200]
+    try:
+        inp = await browser_session._page.wait_for_selector(
+            "input[type='file']", state="attached", timeout=15000
+        )
+    except Exception as exc:
+        return {"ok": False, "reason": f"no input: {exc}"}
+    await inp.set_input_files([str(probe)])
+    await asyncio.sleep(6)
+    info = await browser_session._page.evaluate(
+        """() => {
+            const inputs = Array.from(document.querySelectorAll("input[type='file']"));
+            const b = document.querySelector("img[src^='blob:']");
+            let pub = '';
+            if (b) {
+                let el = b;
+                for (let i = 0; i < 5 && el; i++) el = el.parentElement;
+                pub = ((el ? el.outerHTML : b.outerHTML) || '').slice(0, 2500);
+            }
+            const sendBtn = document.querySelector("[class*='ds-button--primary']");
+            const ta = document.querySelector("textarea");
+            const scope = ta ? ta.closest("main") || document : document;
+            const ctrls = Array.from(
+                scope.querySelectorAll("button, [role='button']")).slice(0, 60);
+            const info2 = ctrls.map(function(el) {
+                let cls = '';
+                try {
+                    cls = String(el.className && el.className.baseVal !== undefined ?
+                        el.className.baseVal : el.className || '').split(' ').slice(0, 3).join('.');
+                } catch (e) { cls = '?'; }
+                return (el.getAttribute('aria-label') || '') + '|' +
+                    (el.textContent || '').trim().slice(0, 12) + '|' + cls;
+            }).filter(function(v, i, a) { return v !== '||' && a.indexOf(v) === i; })
+                .slice(0, 25);
+            return {
+                url: location.href,
+                files: inputs.map(function(el) { return el.files ? el.files.length : -1; }),
+                blob_imgs: document.querySelectorAll("img[src^='blob:']").length,
+                blob_pub: pub,
+                send_disabled: sendBtn ?
+                    (sendBtn.className.indexOf('disabled') >= 0 ||
+                     sendBtn.hasAttribute('disabled')) : null,
+                composer_btns: info2,
+            };
+        }"""
+    )
+    try:
+        plus = await browser_session._page.query_selector(".ds-button--iconLabelPrimary")
+        menu = []
+        if plus:
+            await plus.click()
+            await asyncio.sleep(1.5)
+            menu = await browser_session._page.evaluate(
+                """() => Array.from(document.querySelectorAll(
+                    "[role='menuitem'], [role='option']"))
+                    .map(function(el) { return (el.textContent || '').trim().slice(0, 80); })
+                    .filter(function(x) { return x; }).slice(0, 8)"""
+            )
+    except Exception as exc:
+        menu = ["click-fail: " + str(exc)]
+    info["plus_menu"] = menu
+    info["primer"] = primer_info
+    return {"ok": True, **info}
+
+
+@app.get("/debug/shot")
+async def debug_shot():
+    """Скриншот текущей страницы primary-сессии (диагностика вёрстки)."""
+    import tempfile as _tf
+
+    if not browser_session._page:
+        return {"error": "no page"}
+    shot = Path(_tf.gettempdir()) / "ds_shot.png"
+    await browser_session._page.screenshot(path=str(shot))
+    return FileResponse(shot, media_type="image/png")
+
+
+@app.get("/debug/click")
+async def debug_click(x: int = 0, y: int = 0):
+    """Клик по координатам на текущей странице (отладка без селекторов)."""
+    if not browser_session._page:
+        return {"error": "no page"}
+    await browser_session._page.mouse.click(x, y)
+    await asyncio.sleep(1.5)
+    return {"ok": True, "x": x, "y": y, "url": browser_session._page.url}
+
+
+@app.get("/debug/click_upload")
+async def debug_click_upload(x: int = 0, y: int = 0, file: str = ""):
+    """ВРЕМЕННЫЙ эксперимент: клик по координатам в ожидании file chooser,
+    выбор файла через диалог (как живой пользователь), состояние превью."""
+    import tempfile as _tf
+
+    if not browser_session._page:
+        return {"error": "no page"}
+    src = Path(file) if file else (Path(_tf.gettempdir()) / "ds_probe.png")
+    page = browser_session._page
+    try:
+        async with page.expect_file_chooser(timeout=8000) as fc:
+            await page.mouse.click(x, y)
+        chooser = await fc.value
+    except Exception as exc:
+        return {"ok": False, "stage": "chooser", "reason": str(exc)[:300]}
+    try:
+        await chooser.set_files([str(src)])
+    except Exception as exc:
+        return {"ok": False, "stage": "set_files", "reason": str(exc)[:300]}
+    await asyncio.sleep(6)
+    info = await page.evaluate(
+        """() => ({
+            files: Array.from(document.querySelectorAll("input[type='file']"))
+                .map(function(el) { return el.files ? el.files.length : -1; }),
+            blob: document.querySelectorAll("img[src^='blob:']").length,
+        })"""
+    )
+    return {"ok": True, **info}
+
+
+@app.get("/debug/send_current")
+async def debug_send_current(text: str = "Что на картинке?"):
+    """ВРЕМЕННЫЙ эксперимент: отправляет текст в ТЕКУЩИЙ composer (где уже может
+    лежать прикреплённый файл) и возвращает ответ модели."""
+    sess = browser_session
+    if not sess._page:
+        return {"error": "no page"}
+    try:
+        baseline = await sess._submit_message(text)
+    except Exception as exc:
+        return {"ok": False, "stage": "send", "reason": str(exc)[:300]}
+    try:
+        reasoning, answer = await sess._wait_response_complete(
+            wait_new=True, prompt=text, baseline_text=baseline)
+    except Exception as exc:
+        return {"ok": False, "stage": "wait", "reason": str(exc)[:300]}
+    return {"ok": True, "answer": (answer or "")[:500]}
+
+
+@app.get("/debug/composer_btns")
+async def debug_composer_btns():
+    """ВРЕМЕННАЯ диагностика: соседи кнопки отправки (ищем скрепку структурно)."""
+    if not browser_session._page:
+        return {"error": "no page"}
+    items = await browser_session._page.evaluate(
+        """() => {
+            const out = [];
+            const send = document.querySelector("[class*='ds-button--primary']");
+            if (!send) out.push('no-send-btn');
+            else {
+                const b = send.getBoundingClientRect();
+                out.push('send@' + Math.round(b.x) + ',' + Math.round(b.y));
+            }
+            const all = Array.from(document.querySelectorAll('*'));
+            out.push('total_elements=' + all.length);
+            out.push('readyState=' + document.readyState);
+            const hits = all.filter(function(e) {
+                const t = e.textContent || '';
+                return t.indexOf('Распознав') >= 0;
+            }).map(function(e) {
+                const b = e.getBoundingClientRect();
+                return e.tagName + '|len=' + (e.textContent || '').trim().length +
+                    '|@' + Math.round(b.x) + ',' + Math.round(b.y);
+            }).slice(0, 12);
+            out.push('raspoznav_hits=' + JSON.stringify(hits));
+            return out.slice(0, 30);
+        }"""
+    )
+    return {"ok": True, "items": items}
+
+
 @app.get("/debug/extract")
 async def debug_extract():
     """Отладка: что возвращает извлечение ответа из текущей страницы."""
@@ -880,6 +1194,15 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 file_paths = _save_images_to_tmp(last_user)
                 # В client-режиме ВСЕГДА новый чат (каждый запрос независим).
                 await sess.new_chat()
+                if file_paths:
+                    # Файлы понимает только режим распознавания (Vision):
+                    # без него аплоад висит вечно, а модель слепа.
+                    # В Vision загрузка работает прямо с главной (чат создастся
+                    # при отправке) — праймер не нужен. Без Vision — праймером
+                    # создаём чат (best effort, дальше строгая проверка).
+                    vision = await sess.set_recognition_mode()
+                    if not vision:
+                        await sess.ensure_upload_chat()
                 async for kind, delta in sess.stream_message(
                     prompt,
                     file_paths,
@@ -907,6 +1230,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 file_paths = _save_images_to_tmp(last_user)
                 if request.new_chat:
                     await sess.new_chat()
+                if file_paths:
+                    vision = await sess.set_recognition_mode()
+                    if not vision:
+                        await sess.ensure_upload_chat()
                 async for kind, delta in sess.stream_message(
                     prompt,
                     file_paths,
@@ -1137,8 +1464,6 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                         )
                         parsed, looped_all = _prune_loop_calls(parsed, request.messages)
                         if looped_all:
-                            # Модель перевыпускает уже исполненный вызов — цикл.
-                            # Разрываем: отдаём последний результат как текст.
                             last_res = _last_tool_result(request.messages)
                             rtext = last_res or "Результат выполнения команды получен (см. выше)."
                             parsed = []
@@ -1162,15 +1487,69 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     response_text = EMPTY_ANSWER_FALLBACK
                     break
 
-            if tool_calls_obj is None and sess._looks_busy(response_text):
-                raise BrowserSessionError(
-                    "DeepSeek временно занят (одновременно обрабатывается только один запрос). "
-                    "Подождите несколько секунд и повторите запрос."
+            # --- Retry при "Server busy" с экспоненциальным backoff ---
+            busy_retries = 0
+            while tool_calls_obj is None and sess._looks_busy(response_text):
+                if busy_retries >= settings.RETRY_MAX_ATTEMPTS:
+                    logger.warning("busy-retry: исчерпаны попытки (%d), отдаём ошибку.",
+                                   busy_retries)
+                    raise BrowserSessionError(
+                        "DeepSeek временно занят. "
+                        f"Повторено {busy_retries} раз с нарастающей задержкой. "
+                        "Попробуйте позже."
+                    )
+                delay_ms = min(
+                    settings.RETRY_BASE_DELAY_MS * (
+                        settings.RETRY_BACKOFF_FACTOR ** busy_retries
+                    ),
+                    settings.RETRY_MAX_DELAY_MS,
                 )
+                delay_sec = delay_ms / 1000
+                busy_retries += 1
+                logger.info("busy-retry: #%d — ждём %.1fс перед повтором.",
+                            busy_retries, delay_sec)
+                await asyncio.sleep(delay_sec)
+                # Новый чат + повторная отправка
+                await sess.new_chat()
+                if file_paths:
+                    vision = await sess.set_recognition_mode()
+                    if not vision:
+                        await sess.ensure_upload_chat()
+                rtext = ""
+                rreason = ""
+                async for kind, delta in sess.stream_message(
+                    prompt, file_paths,
+                    deep_think=eff_deep_think, search=eff_search,
+                ):
+                    if kind == "reasoning":
+                        rreason += delta
+                    else:
+                        rtext += delta
+                response_text = rtext
+                reasoning_text = rreason
+                tool_calls_obj = None
+                if request.tools and rtext:
+                    parsed, stripped = _safe_parse_tool_call(rtext, request.tools)
+                    if parsed:
+                        parsed = _anchor_tool_cwd(
+                            parsed, settings.WORK_DIR or _extract_client_cwd(request.messages)
+                        )
+                        tool_calls_obj = [
+                            ToolCall(function=ToolCallFunction(
+                                name=tc["name"],
+                                arguments=json.dumps(tc["arguments"], ensure_ascii=False),
+                            ))
+                            for tc in parsed
+                        ]
+                        response_text = stripped
+                if busy_retries > 0 and not sess._looks_busy(response_text):
+                    logger.info("busy-retry: #%d — ответ получен (%d символов).",
+                                busy_retries, len(response_text))
+
         except BrowserSessionError as exc:
             await session_pool.mark_failed(sess)
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-        except Exception as exc:  # непредвиденная ошибка UI-автоматизации
+        except Exception as exc:
             logger.exception("Ошиброобработки запроса")
             raise HTTPException(status_code=500, detail=f"Внутренняя ошибка: {exc}") from exc
 

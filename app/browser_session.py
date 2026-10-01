@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, List, Optional
 from urllib.parse import urlparse
@@ -286,30 +287,54 @@ class BrowserSession:
     # ---------- Создание нового чата ----------
 
     async def new_chat(self, return_url: bool = True) -> Optional[str]:
+        # «Новый чат» = свежий композер. На ГЛАВНОЙ это no-op по дизайну
+        # (ты уже пишешь новое сообщение) — URL остаётся chat.deepseek.com,
+        # а /a/chat/<id> появляется только ПОСЛЕ первой отправки.
+        # Поэтому проверяем не URL, а наличие свежего поля ввода.
         async with self._lock:
             await self.ensure_logged_in()
-            btn = None
-            if settings.SEL_NEW_CHAT_BUTTON:
+            last_exc = None
+            for attempt in range(3):
+                btn = None
+                if settings.SEL_NEW_CHAT_BUTTON:
+                    try:
+                        btn = await self._page.wait_for_selector(
+                            settings.SEL_NEW_CHAT_BUTTON,
+                            timeout=settings.get_timeout(settings.ACTION_TIMEOUT_MS),
+                        )
+                    except Exception as exc:
+                        logger.warning("Селектор нового чата не найден: %s", exc)
+                        btn = None
+                if btn is None:
+                    btn = await self._find_clickable_by_text(settings.NEW_CHAT_LABELS)
+                if btn is None:
+                    # Кнопки может не быть, если мы уже на свежем композере.
+                    break
                 try:
-                    btn = await self._page.wait_for_selector(
-                        settings.SEL_NEW_CHAT_BUTTON,
-                        timeout=settings.get_timeout(settings.ACTION_TIMEOUT_MS),
-                    )
+                    await btn.click()
                 except Exception as exc:
-                    logger.warning("Селектор нового чата не найден: %s", exc)
-                    btn = None
-            if btn is None:
-                btn = await self._find_clickable_by_text(settings.NEW_CHAT_LABELS)
-            if btn is None:
+                    last_exc = exc
+                    await asyncio.sleep(1)
+                    continue
+                await asyncio.sleep(1.5)
+                await self._wait_navigation_settled()
+                break
+            try:
+                await self._page.wait_for_selector(
+                    settings.SEL_MESSAGE_INPUT, state="attached",
+                    timeout=settings.get_timeout(settings.ACTION_TIMEOUT_MS),
+                )
+            except Exception as exc:
                 await self._debug_dump("newchat")
                 raise BrowserSessionError(
-                    "Не удалось найти кнопку 'New chat' (проверьте SEL_NEW_CHAT_BUTTON / NEW_CHAT_LABELS)."
+                    f"Нет свежего поля ввода после 'New chat': {last_exc or exc}"
                 )
-            await btn.click()
-            await asyncio.sleep(1.5)
-            await self._wait_navigation_settled()
-            logger.info("Создан новый чат. Текущий URL: %s", self._page.url)
-            return self._page.url if return_url else None
+            try:
+                url = self._page.url
+            except Exception:
+                url = ""
+            logger.info("Новый чат готов. Текущий URL: %s", url)
+            return url if return_url else None
 
     async def _wait_navigation_settled(self) -> None:
         try:
@@ -697,6 +722,74 @@ class BrowserSession:
     '''
     EXTRACT_CALL_JS = "(el) => { " + EXTRACT_FN_SRC + "\n return extractContent(el); }"
 
+    async def _copy_last_assistant_message(self) -> Optional[str]:
+        """Получает текст через штатную кнопку копирования DeepSeek.
+
+        Кнопка копирования лучше сохраняет исходное форматирование ответа,
+        особенно для markdown-кода. Если конкретная версия UI не поддерживает
+        такой способ или кнопка не найдена, вызывающий код использует DOM-fallback.
+        """
+        try:
+            result = await self._page.evaluate(
+                """async () => {
+                    const wrappers = Array.from(document.querySelectorAll(
+                        "div[class*='ds-message']:not([class*='main-content'])"
+                    ));
+                    let last = null;
+                    for (const wrapper of wrappers) {
+                        if (wrapper.querySelector("[class*='ds-assistant-message-main-content']")) {
+                            last = wrapper;
+                        }
+                    }
+                    if (!last) return null;
+
+                    const isCopy = (el) => {
+                        const attrs = [
+                            el.getAttribute('aria-label'), el.getAttribute('title'),
+                            el.getAttribute('data-testid'), el.textContent
+                        ].filter(Boolean).join(' ').toLowerCase();
+                        return /copy|копир|скопировать/.test(attrs);
+                    };
+                    const button = Array.from(last.querySelectorAll(
+                        "button, [role='button']"
+                    )).find((el) => !el.closest('pre') && isCopy(el));
+                    if (!button) return null;
+
+                    let copied = null;
+                    const clipboard = navigator.clipboard;
+                    const originalWrite = clipboard && clipboard.writeText;
+                    let patched = false;
+                    if (clipboard && originalWrite) {
+                        try {
+                            Object.defineProperty(clipboard, 'writeText', {
+                                configurable: true,
+                                value: async (value) => { copied = String(value); }
+                            });
+                            patched = true;
+                        } catch (_) {}
+                    }
+
+                    button.click();
+                    await new Promise((resolve) => setTimeout(resolve, 150));
+
+                    if (patched) {
+                        try {
+                            Object.defineProperty(clipboard, 'writeText', {
+                                configurable: true, value: originalWrite
+                            });
+                        } catch (_) {}
+                    }
+                    if (copied !== null) return copied;
+                    try { return await navigator.clipboard.readText(); } catch (_) {}
+                    return null;
+                }"""
+            )
+            if isinstance(result, str) and result.strip():
+                return result.strip()
+        except Exception as exc:
+            logger.debug("Не удалось скопировать ответ штатной кнопкой: %s", exc)
+        return None
+
     @staticmethod
     def _looks_busy(text: str) -> bool:
         """True, если извлечённый текст похож на сообщение DeepSeek 'сервис занят'."""
@@ -706,7 +799,13 @@ class BrowserSession:
         markers = ["сервис занят", "занят обработкой", "одновременно поддерживается", "повтор через"]
         return any(m in t for m in markers) and len(t) < 600
 
-    async def _extract_response_text(self, prompt: str = "") -> str:
+    async def _extract_response_text(
+        self, prompt: str = "", use_copy_button: bool = False
+    ) -> str:
+        if use_copy_button:
+            copied = await self._copy_last_assistant_message()
+            if copied:
+                return copied
         els = await self._page.query_selector_all(settings.SEL_ASSISTANT_BLOCK)
         if els:
             # берём последний НЕпустой блок (последний в DOM может быть пустым
@@ -829,6 +928,8 @@ class BrowserSession:
         stable = 0
         await asyncio.sleep(1.5)
         deadline = loop.time() + settings.get_timeout(settings.RESPONSE_TIMEOUT_MS) / 1000.0
+        _t0 = loop.time()
+        _last_log = _t0
         while loop.time() < deadline:
             if await self._is_challenge_present():
                 break
@@ -858,6 +959,10 @@ class BrowserSession:
                 stable += 1
                 if stable >= 2:
                     break
+            if loop.time() - _last_log >= 30:
+                _last_log = loop.time()
+                logger.info("stream-wait: %.0fc, seen_new=%s, r=%d, c=%d",
+                            loop.time() - _t0, seen_new, len(r), len(c))
             await asyncio.sleep(0.4)
 
     async def _extract_response_parts(self, prompt: str = "") -> tuple:
@@ -900,6 +1005,8 @@ class BrowserSession:
         # небольшая пауза, чтобы ответ начал появляться в DOM
         await asyncio.sleep(4.0 if not require_change else 2.0)
         deadline = loop.time() + settings.get_timeout(settings.RESPONSE_TIMEOUT_MS) / 1000.0
+        _t0 = loop.time()
+        _last_log = _t0
         while loop.time() < deadline:
             text = await self._extract_response_text(prompt)
             # Фиксируем любое изменение относительно baseline (в т.ч. кратковременную
@@ -914,6 +1021,10 @@ class BrowserSession:
             else:
                 stable = 0
             last = text
+            if loop.time() - _last_log >= 30:
+                _last_log = loop.time()
+                logger.info("resp-wait: %.0fc, saw_change=%s, stable=%d, len=%d",
+                            loop.time() - _t0, saw_change, stable, len(text))
             await asyncio.sleep(1.0)
 
         if not last:
@@ -925,11 +1036,91 @@ class BrowserSession:
                 )
             await self._debug_dump("response")
             raise BrowserSessionError("Не удалось найти ответ ассистента в интерфейсе.")
+        copied = await self._extract_response_text(prompt, use_copy_button=True)
+        if copied:
+            last = copied
         reasoning, _ = await self._extract_response_parts(prompt)
         await self._save_cookies_to_file()
         return reasoning, last.strip()
 
     # ---------- Вложения ----------
+
+    async def _paperclip_chooser(self):
+        """Ищет скрепку структурно (ближайший iconLabelPrimary слева от кнопки
+        отправки) и кликает в ожидании нативного file chooser.
+        Возвращает FileChooser или None (тогда caller идёт запасным путём)."""
+        try:
+            box = await self._page.evaluate(
+                """() => {
+                    const send = document.querySelector("[class*='ds-button--primary']");
+                    if (!send) return null;
+                    const sr = send.getBoundingClientRect();
+                    const cands = Array.from(document.querySelectorAll(
+                        ".ds-button--iconLabelPrimary"));
+                    let best = null, bestDx = 1e9;
+                    for (const el of cands) {
+                        const b = el.getBoundingClientRect();
+                        if (b.width === 0 || b.height === 0) continue;
+                        if (Math.abs((b.y + b.height / 2) - (sr.y + sr.height / 2)) > 60) continue;
+                        const dx = sr.x - b.x;
+                        if (dx > 0 && dx < bestDx) {
+                            bestDx = dx;
+                            best = {x: b.x + b.width / 2, y: b.y + b.height / 2};
+                        }
+                    }
+                    return best;
+                }"""
+            )
+        except Exception as exc:
+            logger.warning("attach: поиск скрепки не удался: %s", exc)
+            return None
+        if not box:
+            logger.info("attach: скрепка не найдена (нет send/иконки рядом) — fallback.")
+            return None
+        logger.info("attach: скрепка найдена @(%.0f,%.0f), кликаем в ожидании диалога.",
+                    box["x"], box["y"])
+        # Фаза 1: вдруг диалог открывается напрямую (вариант главной).
+        try:
+            async with self._page.expect_file_chooser(timeout=4000) as fc:
+                await self._page.mouse.click(box["x"], box["y"])
+            logger.info("attach: диалог открылся сразу.")
+            return await fc.value
+        except Exception:
+            pass
+        # Фаза 2: в чате скрепка открывает МЕНЮ — ищем пункт про файл/фото.
+        try:
+            items = await self._page.evaluate(
+                """() => {
+                    const rx = /файл|file|mage|фото|photo|изображ|pload|док|doc|влож|attach/i;
+                    const els = Array.from(document.querySelectorAll(
+                        "[role='menuitem'], [role='option'], li, button"));
+                    const vis = [];
+                    for (const el of els) {
+                        const t = (el.innerText || '').trim();
+                        if (!t || t.length > 40 || !rx.test(t)) continue;
+                        const b = el.getBoundingClientRect();
+                        if (b.width < 2 || b.height < 2) continue;
+                        vis.push({x: b.x + b.width / 2, y: b.y + b.height / 2, t: t});
+                        if (vis.length >= 5) break;
+                    }
+                    return vis;
+                }"""
+            )
+        except Exception as exc:
+            logger.info("attach: поиск меню не удался: %s", str(exc)[:120])
+            return None
+        if not items:
+            logger.info("attach: меню нет — fallback.")
+            return None
+        logger.info("attach: пункт меню '%s', кликаем.", items[0].get("t"))
+        try:
+            async with self._page.expect_file_chooser(timeout=8000) as fc:
+                await self._page.mouse.click(items[0]["x"], items[0]["y"])
+            logger.info("attach: диалог открылся через меню.")
+            return await fc.value
+        except Exception as exc:
+            logger.info("attach: диалог не открылся: %s", str(exc)[:120])
+            return None
 
     async def _attach_files(self, file_paths: List[str]) -> None:
         if not file_paths:
@@ -943,20 +1134,150 @@ class BrowserSession:
             if not Path(path).exists():
                 raise BrowserSessionError(f"Файл не найден: {path}")
 
-        if settings.SEL_ATTACH_BUTTON != settings.SEL_FILE_INPUT:
+        upload_completed = asyncio.Event()
+        pending_responses: list[str] = []
+
+        def _on_response(resp):
+            url = resp.url if hasattr(resp, "url") else ""
+            status = resp.status if hasattr(resp, "status") else 0
+            if not url or not status:
+                return
+            lower = url.lower()
+            is_upload = any(k in lower for k in
+                           ("upload", "file", "attach", "blob",
+                            "image", "media", "asset"))
+            if is_upload:
+                pending_responses.append(f"{status} {url[:120]}")
+                logger.info("attach: network response %s %s", status, url[:120])
+                upload_completed.set()
+
+        self._page.on("response", _on_response)
+
+        try:
+            via_chooser = False
+            chooser = await self._paperclip_chooser()
+            if chooser is not None:
+                try:
+                    await chooser.set_files(file_paths)
+                    via_chooser = True
+                    logger.info("attach: файлы выбраны через диалог скрепки.")
+                except Exception as exc:
+                    logger.warning("attach: set_files через диалог не удался: %s", exc)
+            if not via_chooser:
+                if settings.SEL_ATTACH_BUTTON != settings.SEL_FILE_INPUT:
+                    try:
+                        await self._page.click(
+                            settings.SEL_ATTACH_BUTTON,
+                            timeout=settings.get_timeout(settings.ACTION_TIMEOUT_MS),
+                        )
+                    except Exception:
+                        pass
+                file_input = None
+                for _ in range(2):
+                    try:
+                        file_input = await self._page.wait_for_selector(
+                        settings.SEL_FILE_INPUT, state="attached",
+                        timeout=settings.get_timeout(settings.ACTION_TIMEOUT_MS),
+                    )
+                        break
+                    except Exception:
+                        try:
+                            await self._page.click(
+                                "button:has(svg), [aria-label*='ttach'], "
+                                "[aria-label*='рикрепи'], [aria-label*='pload'], "
+                                "[aria-label*='айл']",
+                                timeout=3000,
+                            )
+                        except Exception:
+                            pass
+                if file_input is None:
+                    raise BrowserSessionError(
+                        "Не найден input для загрузки файлов "
+                        "(проверьте SEL_FILE_INPUT)."
+                    )
+                await file_input.set_input_files(file_paths)
+                logger.info("attach: set_input_files ok.")
+
+            ok = False
+            deadline = time.time() + 90
+            while time.time() < deadline:
+                if upload_completed.is_set():
+                    logger.info("attach: upload response received — ok.")
+                    ok = True
+                    break
+                try:
+                    imgs = await self._page.query_selector_all("img[src^='blob:']")
+                except Exception:
+                    imgs = []
+                if imgs:
+                    logger.info("attach: %d blob-img(s) found — ok.", len(imgs))
+                    ok = True
+                    break
+                await asyncio.sleep(1.5)
+
+            if not ok:
+                raise BrowserSessionError(
+                    f"Аплоад файлов не завершился за 90 сек "
+                    f"({len(file_paths)} шт.) [{pending_responses}]."
+                )
+
             try:
-                await self._page.click(
-                    settings.SEL_ATTACH_BUTTON, timeout=settings.get_timeout(settings.ACTION_TIMEOUT_MS)
+                await self._page.wait_for_load_state(
+                    "networkidle", timeout=15000
                 )
             except Exception:
                 pass
+            await asyncio.sleep(1)
 
-        file_input = await self._page.wait_for_selector(
-            settings.SEL_FILE_INPUT, timeout=settings.get_timeout(settings.ACTION_TIMEOUT_MS)
-        )
-        await file_input.set_input_files(file_paths)
+        finally:
+            try:
+                self._page.remove_listener("response", _on_response)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _cleanup_upload_dirs(file_paths) -> None:
+        """Удаляет временные chat_upload_* каталоги после отправки (best-effort)."""
+        import shutil
+
+        seen = set()
+        for p in file_paths or []:
+            try:
+                parent = Path(p).parent
+                if parent.name.startswith("chat_upload_") and str(parent) not in seen:
+                    seen.add(str(parent))
+                    shutil.rmtree(parent, ignore_errors=True)
+            except Exception:
+                pass
 
     # ---------- Действия ----------
+
+    async def _verify_attachments_ready(self, file_paths: List[str]) -> None:
+        """Проверка: blob-превью файлов ДОЛЖНЫ быть в DOM.
+        Спиннер DeepSeek НЕ гаснет (UI-артефакт) — не ждём его.
+        Ждём blob-img + networkidle (реальное завершение аплоада)."""
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                imgs = await self._page.query_selector_all("img[src^='blob:']")
+            except Exception:
+                imgs = []
+            if imgs:
+                logger.info("verify: %d blob-img(s) found — waiting networkidle.",
+                            len(imgs))
+                try:
+                    await self._page.wait_for_load_state(
+                        "networkidle", timeout=15000
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+                return
+            await asyncio.sleep(1.5)
+        raise BrowserSessionError(
+            f"Файлы выбраны, но blob-превью не появились за 30 сек "
+            f"({len(file_paths)} шт.)."
+        )
 
     async def _submit_message(
         self,
@@ -995,6 +1316,11 @@ class BrowserSession:
             )
 
         await self._attach_files(file_paths or [])
+
+        # Строгая проверка: файлы ДОЛЖНЫ быть в DOM и аплоад завершён.
+        # Без этого DeepSeek получает текст БЕЗ картинки.
+        if file_paths:
+            await self._verify_attachments_ready(file_paths)
 
         try:
             input_box = await self._page.wait_for_selector(
@@ -1061,6 +1387,9 @@ class BrowserSession:
 
         if not send_clicked:
             await input_box.press("Enter")
+
+        # Файлы уже ушли в чат — чистим временные каталоги загрузки.
+        self._cleanup_upload_dirs(file_paths)
 
         # Запоминаем текущий последний ответ, чтобы при ожидании НЕ
         # вернуть случайно старый (стабильный) ответ из предыдущего
@@ -1341,6 +1670,126 @@ class BrowserSession:
             if not has_assistant:
                 user_msgs.append(w)
         return user_msgs
+
+    async def set_recognition_mode(self) -> bool:
+        """Включает режим распознавания файлов.
+
+        Без него: загрузка виснет навсегда (спиннер не гаснет), модель отвечает
+        «не могу просматривать изображения» / «Не удалось разобрать» /
+        «No text found. Try Vision».
+        Язык интерфейса плавает (RU/EN): ищем таб «Распознавание»/«Vision»,
+        запасной путь — ссылка «Try Vision» / «режим распознавания».
+        Вызывать на главной ДО attach. Возвращает True, если режим включён.
+        """
+        # Табы могут дорисоваться поздно — опрашиваем до ~30 секунд.
+        try:
+            await self._wait_navigation_settled()
+        except Exception:
+            pass
+        hit = "no-tab"
+        for _ in range(15):
+            try:
+                hit = await self._page.evaluate(
+                    """() => {
+                        const norm = function(s) {
+                            return (s || '').replace(/\\s+/g, '').toLowerCase();
+                        };
+                        const want = ['распознавание', 'vision'];
+                        const all = Array.from(document.querySelectorAll('*'));
+                        let el = all.find(function(e) {
+                            return want.indexOf(norm(e.textContent)) >= 0;
+                        });
+                        if (!el) {
+                            el = all.find(function(e) {
+                                const t = (e.textContent || '').trim();
+                                return t.length < 60 && (
+                                    t === 'Try Vision' ||
+                                    t.indexOf('режим распознавания') >= 0);
+                            });
+                        }
+                        if (!el) return 'no-tab';
+                        el.click();
+                        return 'clicked:' + el.tagName + '=' +
+                            (el.textContent || '').trim().slice(0, 30);
+                    }"""
+                )
+            except Exception as exc:
+                hit = f"tab-fail: {exc}"
+            if str(hit).startswith("clicked"):
+                break
+            await asyncio.sleep(2)
+        logger.info("recognition: %s", hit)
+        if not str(hit).startswith("clicked"):
+            return False
+        # Проверяем, что режим встал (заголовок содержит Vision/Распознавание).
+        await asyncio.sleep(2)
+        try:
+            mode_ok = await self._page.evaluate(
+                """() => {
+                    const t = (document.body.innerText || '');
+                    if (t.indexOf('Vision') >= 0 || t.indexOf('Распознава') >= 0)
+                        return true;
+                    const want = ['распознавание', 'vision'];
+                    const tabs = Array.from(document.querySelectorAll(
+                        '[role=tab], [class*=tab], [data-value]'));
+                    for (const el of tabs) {
+                        const txt = (el.textContent || '').trim().toLowerCase()
+                            .replace(/\\s+/g, '');
+                        if (want.indexOf(txt) >= 0) {
+                            const cls = (el.className || '').toLowerCase();
+                            if (cls.indexOf('active') >= 0 ||
+                                cls.indexOf('selected') >= 0 ||
+                                el.getAttribute('aria-selected') === 'true' ||
+                                el.getAttribute('data-selected') === 'true')
+                                return true;
+                        }
+                    }
+                    return false;
+                }"""
+            )
+        except Exception:
+            mode_ok = False
+        logger.info("recognition: mode_active=%s", bool(mode_ok))
+        return bool(mode_ok)
+
+    async def ensure_upload_chat(self) -> None:
+        """Гарантирует, что вкладка ВНУТРИ чата (нужно для загрузки файлов).
+
+        Свежая вкладка сидит на главной, где аплоад input'ом игнорируется,
+        а кнопка «Новый чат» там же — no-op. Поэтому создаём чат праймером:
+        отправляем '.', останавливаем его генерацию и остаёмся в созданном
+        чате. Мусорное '.' в истории — плата за рабочий аплоад.
+        """
+        async with self._lock:
+            try:
+                if "/a/chat/" in self._page.url:
+                    return
+            except Exception:
+                pass
+            # Ждём короткий ответ праймера естественным путём (без стопа —
+            # стоп оставляет композер в состоянии, где аплоад не стартует).
+            # Ответ на "." короткий (секунды). При сбое — стоп как запасной путь.
+            try:
+                baseline = await self._submit_message(".")
+            except Exception as exc:
+                raise BrowserSessionError(f"Праймер не отправился: {exc}")
+            try:
+                await self._wait_response_complete(
+                    wait_new=True, prompt=".", baseline_text=baseline)
+            except Exception:
+                try:
+                    await self.stop_generation()
+                except Exception:
+                    pass
+            try:
+                url = self._page.url
+            except Exception as exc:
+                raise BrowserSessionError(f"Не удалось проверить URL чата: {exc}")
+            if "/a/chat/" not in url:
+                raise BrowserSessionError(
+                    f"Праймер не создал чат для загрузки файлов (URL={url})."
+                )
+            logger.info("Праймер создал чат для аплоада: %s", url)
 
     async def stop_generation(self) -> str:
         selectors = [
