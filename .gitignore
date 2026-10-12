@@ -14,6 +14,7 @@ env/
 # --- Секреты и учётные данные (НЕ КОММИТИТЬ) ---
 .env
 .env.local
+initial_message.txt
 *.sqlite3
 data/
 pw_profile*/

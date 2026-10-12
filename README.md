@@ -48,6 +48,15 @@ OpenAI-совместимого клиента: поддерживаются р�
   - `client` — клиент шлёт всю историю; мост «сплющивает» её в одно сообщение
     и каждый запрос начинает **новый** чат DeepSeek (полностью stateless,
     без утечки прошлых ответов). НУЖЕН для opencode / Kilo Code.
+- **Стартовое сообщение нового чата**: `INITIAL_MESSAGE_ENABLED=true` и
+  `INITIAL_MESSAGE_FILE=./initial_message.txt`. Мост отправляет его первым,
+  ждёт ответ, фиксирует настоящий `conversation_id` и проверяет, что основной
+  запрос уходит в тот же тред. В `server` это происходит один раз при создании
+  чата; в `client` — для каждого нового stateless-чата.
+- При `STRICT_CHAT_AFFINITY=true` продолжение `server`-диалога обязано передать
+  `conversation_id` из предыдущего ответа. Это не даёт round-robin пулу отправить
+  сообщение в другой аккаунт или вкладку. Первый запрос и `new_chat=true`
+  по-прежнему могут быть без ID.
 - **Пул профилей** (`profiles.json` / `DS_PROFILES`, пример: `profiles.json.example`):
   round-robin по нескольким аккаунтам DeepSeek, упавший профиль уходит
   в cooldown (`POOL_COOLDOWN_SECONDS`) и возвращается сам; статус — в `/healthz`.
@@ -235,9 +244,9 @@ curl http://localhost:8000/v1/chat/completions \
 | GET  | `/v1/models` | Список доступных режимов (`deepseek-*`) |
 | GET  | `/v1/chat/list` | Список чатов |
 | POST | `/v1/chat/switch` | Переключиться на чат (`chat_id`) |
-| GET  | `/v1/chat/history?chat_id=` | История сообщений чата |
+| GET  | `/v1/chat/history?chat_id=` | История указанного (или текущего) чата |
 | POST | `/v1/chat/new` | Новый чат (возвращает `chat_id`) |
-| POST | `/v1/chat/stop` | Остановить текущую генерацию |
+| POST | `/v1/chat/stop?chat_id=` | Остановить генерацию указанного/текущего чата |
 | GET  | `/healthz` | Проверка живости: `status`, `uptime`, `mode`, `pool` (профили), `version` |
 | GET  | `/ui` | Встроенный Web UI (чат) |
 
@@ -262,7 +271,10 @@ curl http://localhost:8000/v1/chat/completions \
 
 ### 1. Анти-детект и браузерная инфраструктура
 
-- ✅ **patchright** (`ANTIDETECT=patchright`) — работает, остаётся основным.
+- ✅ **patchright** (`BROWSER_BACKEND=patchright`) — основной backend и
+  единственный браузерный runtime из `requirements.txt`; это исключает конфликт
+  зависимостей со старым Playwright. Обычный Playwright ставится отдельно и
+  включается только через `BROWSER_BACKEND=playwright`.
 - ❌ **rebrowser-patches / Camoufox / botright / nodriver / CDP к чужому браузеру**
   Отложено: patchright закрывает задачу, зоопарк драйверов не нужен.
 - ✅ **Пул сессий с параллельностью** (`app/session_pool.py`, `profiles.json`)

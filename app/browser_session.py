@@ -34,9 +34,12 @@ def _text_delta(prev: str, new: str) -> str:
         i += 1
     return new[i:]
 
-# --- Анти-детект браузер (patchright) ---
-_antidetect = os.getenv("ANTIDETECT", "")
-if _antidetect:
+# --- Браузерный backend (patchright по умолчанию) ---
+# ANTIDETECT оставлен как legacy-алиас для старых .env.
+_browser_backend = os.getenv(
+    "BROWSER_BACKEND", os.getenv("ANTIDETECT", "patchright")
+).strip().lower()
+if _browser_backend != "playwright":
     try:
         from patchright.async_api import (
             async_playwright,
@@ -47,9 +50,9 @@ if _antidetect:
         _USING_PATCHRIGHT = True
     except ImportError:
         logging.warning(
-            "ANTIDETECT=%s, но patchright не установлен (pip install patchright). "
+            "BROWSER_BACKEND=%s, но patchright не установлен. "
             "Используется обычный playwright.",
-            _antidetect,
+            _browser_backend,
         )
         from playwright.async_api import (
             async_playwright,
@@ -292,49 +295,90 @@ class BrowserSession:
         # а /a/chat/<id> появляется только ПОСЛЕ первой отправки.
         # Поэтому проверяем не URL, а наличие свежего поля ввода.
         async with self._lock:
-            await self.ensure_logged_in()
-            last_exc = None
-            for attempt in range(3):
-                btn = None
-                if settings.SEL_NEW_CHAT_BUTTON:
-                    try:
-                        btn = await self._page.wait_for_selector(
-                            settings.SEL_NEW_CHAT_BUTTON,
-                            timeout=settings.get_timeout(settings.ACTION_TIMEOUT_MS),
-                        )
-                    except Exception as exc:
-                        logger.warning("Селектор нового чата не найден: %s", exc)
-                        btn = None
-                if btn is None:
-                    btn = await self._find_clickable_by_text(settings.NEW_CHAT_LABELS)
-                if btn is None:
-                    # Кнопки может не быть, если мы уже на свежем композере.
-                    break
+            return await self._new_chat_unlocked(return_url=return_url)
+
+    async def _new_chat_unlocked(self, return_url: bool = True) -> Optional[str]:
+        """new_chat без захвата self._lock; только для составных операций."""
+        await self.ensure_logged_in()
+        last_exc = None
+        for _ in range(3):
+            btn = None
+            if settings.SEL_NEW_CHAT_BUTTON:
                 try:
-                    await btn.click()
+                    btn = await self._page.wait_for_selector(
+                        settings.SEL_NEW_CHAT_BUTTON,
+                        timeout=settings.get_timeout(settings.ACTION_TIMEOUT_MS),
+                    )
                 except Exception as exc:
-                    last_exc = exc
-                    await asyncio.sleep(1)
-                    continue
-                await asyncio.sleep(1.5)
-                await self._wait_navigation_settled()
+                    logger.warning("Селектор нового чата не найден: %s", exc)
+            if btn is None:
+                btn = await self._find_clickable_by_text(settings.NEW_CHAT_LABELS)
+            if btn is None:
                 break
             try:
-                await self._page.wait_for_selector(
-                    settings.SEL_MESSAGE_INPUT, state="attached",
-                    timeout=settings.get_timeout(settings.ACTION_TIMEOUT_MS),
-                )
+                await btn.click()
             except Exception as exc:
-                await self._debug_dump("newchat")
+                last_exc = exc
+                await asyncio.sleep(1)
+                continue
+            await asyncio.sleep(1.5)
+            await self._wait_navigation_settled()
+            break
+        try:
+            await self._page.wait_for_selector(
+                settings.SEL_MESSAGE_INPUT, state="attached",
+                timeout=settings.get_timeout(settings.ACTION_TIMEOUT_MS),
+            )
+        except Exception as exc:
+            await self._debug_dump("newchat")
+            raise BrowserSessionError(
+                f"Нет свежего поля ввода после 'New chat': {last_exc or exc}"
+            )
+        try:
+            url = self._page.url
+        except Exception:
+            url = ""
+        logger.info("Новый чат готов. Текущий URL: %s", url)
+        return url if return_url else None
+
+    async def prepare_chat(
+        self,
+        *,
+        initial_message: str = "",
+        create_new: bool = False,
+        chat_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Подготовить точный чат и отправить bootstrap только в свежий тред."""
+        async with self._lock:
+            if create_new:
+                await self._new_chat_unlocked()
+                chat_id = None
+            elif chat_id:
+                await self.ensure_chat(chat_id)
+
+            current_id = await self.get_current_chat_id()
+            is_fresh = create_new or (chat_id is None and current_id is None)
+            message = (initial_message or "").strip()
+            if not message or not is_fresh:
+                return current_id or chat_id
+
+            baseline = await self._submit_message(message, chat_id=current_id)
+            await self._wait_response_complete(
+                wait_new=True, prompt=message, baseline_text=baseline
+            )
+            created_id = await self.get_current_chat_id()
+            if not created_id:
                 raise BrowserSessionError(
-                    f"Нет свежего поля ввода после 'New chat': {last_exc or exc}"
+                    "Стартовое сообщение отправлено, но DeepSeek не выдал chat_id."
                 )
-            try:
-                url = self._page.url
-            except Exception:
-                url = ""
-            logger.info("Новый чат готов. Текущий URL: %s", url)
-            return url if return_url else None
+            verified_id = await self.get_current_chat_id()
+            if verified_id != created_id:
+                raise BrowserSessionError(
+                    "Чат изменился после стартового сообщения; запрос остановлен, "
+                    "чтобы не попасть в другой диалог."
+                )
+            logger.info("Стартовое сообщение отправлено в чат %s", created_id)
+            return created_id
 
     async def _wait_navigation_settled(self) -> None:
         try:
@@ -1584,6 +1628,12 @@ class BrowserSession:
         except Exception:
             return None
 
+    def get_current_url(self) -> str:
+        try:
+            return self._page.url if self._page else ""
+        except Exception:
+            return ""
+
     async def ensure_chat(self, chat_id: str) -> None:
         try:
             cur = await self.get_current_chat_id()
@@ -1597,6 +1647,11 @@ class BrowserSession:
         url = f"{settings.CHAT_URL.rstrip('/')}/a/chat/s/{chat_id}"
         await self._page.goto(url, timeout=settings.get_timeout(settings.NAV_TIMEOUT_MS))
         await self._wait_navigation_settled()
+        current = await self.get_current_chat_id()
+        if current != chat_id:
+            raise BrowserSessionError(
+                f"DeepSeek открыл чат {current or 'без id'} вместо {chat_id}."
+            )
         logger.info("Переключение на чат %s", chat_id)
 
     async def list_chats(self) -> List[dict]:

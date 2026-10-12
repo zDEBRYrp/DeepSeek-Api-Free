@@ -103,6 +103,7 @@ class SessionPool:
         self._lock = asyncio.Lock()
         self._default_cooldown = max(1.0, float(cooldown_seconds))
         self._max_wait = max(0.0, float(max_wait_seconds))
+        self._chat_sessions: dict[str, object] = {}
 
     def add(self, name: str, session) -> None:
         self._names.append(name)
@@ -136,7 +137,9 @@ class SessionPool:
             except Exception as exc:
                 logger.warning("Ошибка закрытия профиля '%s': %s", name, exc)
 
-    async def acquire(self, timeout: Optional[float] = None) -> object:
+    async def acquire(
+        self, timeout: Optional[float] = None, chat_id: Optional[str] = None
+    ) -> object:
         """Свободная сессия (round-robin, мимо cooling и занятых).
 
         Параллельность = размер пула: разные запросы получают разные сессии
@@ -150,9 +153,15 @@ class SessionPool:
         while True:
             async with self._lock:
                 now = time.time()
-                for _ in range(len(self._sessions)):
-                    idx = self._index
-                    self._index = (self._index + 1) % len(self._sessions)
+                preferred = self._chat_sessions.get(chat_id or "")
+                if preferred in self._sessions:
+                    indices = [self._sessions.index(preferred)]
+                else:
+                    indices = []
+                    for _ in range(len(self._sessions)):
+                        indices.append(self._index)
+                        self._index = (self._index + 1) % len(self._sessions)
+                for idx in indices:
                     if idx not in self._in_use and self._cooldown_until[idx] <= now:
                         self._in_use.add(idx)
                         return self._sessions[idx]
@@ -167,6 +176,26 @@ class SessionPool:
             # освобождения занятой сессии (poll).
             step = min_cool if min_cool > 0 else 0.25
             await asyncio.sleep(max(0.05, min(step, remaining, 1.0)))
+
+    async def bind_chat(self, session, chat_id: Optional[str]) -> None:
+        """Привязать DeepSeek chat_id к создавшей его сессии/профилю."""
+        if not chat_id:
+            return
+        async with self._lock:
+            if session in self._sessions:
+                key = str(chat_id)
+                self._chat_sessions.pop(key, None)
+                self._chat_sessions[key] = session
+                if len(self._chat_sessions) > 4096:
+                    oldest = next(iter(self._chat_sessions))
+                    self._chat_sessions.pop(oldest, None)
+
+    async def get_session_for_chat(self, chat_id: Optional[str]):
+        """Lookup для stop: активная генерация уже держит слот пула."""
+        if not chat_id:
+            return self.primary()
+        async with self._lock:
+            return self._chat_sessions.get(str(chat_id))
 
     async def release(self, session) -> None:
         """Вернуть сессию в ротацию после завершения запроса."""

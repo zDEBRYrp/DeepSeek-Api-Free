@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
@@ -41,7 +42,7 @@ from app.summarizer import SummarizerUnavailableError, summarize_text
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
-app = FastAPI(title="Internal Chat UI Bridge", version="1.0.0")
+app = FastAPI(title="Internal Chat UI Bridge", version="1.1.0")
 _started_at = time.time()
 
 # CORS для локальных веб-клиентов.
@@ -56,6 +57,13 @@ if settings.ALLOWED_ORIGINS:
 
 # Bearer-авторизация /v1/* + access-лог (пустой API_KEY = без проверки).
 install_security(app, api_key=settings.API_KEY)
+
+
+@app.middleware("http")
+async def guard_debug_endpoints(request: Request, call_next):
+    if request.url.path.startswith("/debug/") and not settings.ENABLE_DEBUG_ENDPOINTS:
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    return await call_next(request)
 
 # Per-IP rate limit на генерацию (скользящее окно, без slowapi).
 RATE_LIMITER = SlidingWindowLimiter(
@@ -89,10 +97,12 @@ def _check_rate_limit(http_request: Request) -> None:
         )
 
 
-async def _pool_acquire_or_429():
+async def _pool_acquire_or_429(chat_id: Optional[str] = None):
     """Свободная сессия из пула (или 429, если все заняты / в cooldown)."""
     try:
-        return await session_pool.acquire(timeout=REQUEST_QUEUE_TIMEOUT)
+        return await session_pool.acquire(
+            timeout=REQUEST_QUEUE_TIMEOUT, chat_id=chat_id
+        )
     except PoolExhaustedError as exc:
         raise HTTPException(
             status_code=429,
@@ -101,6 +111,23 @@ async def _pool_acquire_or_429():
         )
 
 
+def _validate_chat_affinity(request: ChatCompletionRequest) -> None:
+    """Не допускает неоднозначное продолжение server-диалога."""
+    if (
+        settings.STRICT_CHAT_AFFINITY
+        and settings.MEMORY_MODE == "server"
+        and not request.new_chat
+        and not request.conversation_id
+        and request.messages
+        and len(request.messages) > 1
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Для продолжения диалога в MEMORY_MODE=server передайте "
+                "conversation_id из предыдущего ответа или установите new_chat=true."
+            ),
+        )
 async def _maybe_summarize(conv: str) -> str:
     """Сжать середину длинного диалога внешним LLM вместо обрезки.
 
@@ -730,22 +757,24 @@ async def healthz():
         "total": 0, "active": 0, "cooling": 0, "profiles": []
     }
     return {
-        "status": "ok",
+        "status": "ok" if pool.get("active", 0) > 0 else "degraded",
         "uptime": int(time.time() - _started_at),
         "mode": settings.MEMORY_MODE,
+        "initial_message_enabled": settings.INITIAL_MESSAGE_ENABLED,
+        "strict_chat_affinity": settings.STRICT_CHAT_AFFINITY,
         "pool": pool,
         "version": app.version,
     }
 
 
-@app.get("/debug/dump")
+@app.get("/debug/dump", include_in_schema=settings.ENABLE_DEBUG_ENDPOINTS)
 async def debug_dump():
     """Отладочный эндпоинт: сбрасывает HTML текущей страницы в debug_page.html."""
     url = await browser_session.dump_page_html()
     return {"ok": True, "url": url}
 
 
-@app.get("/debug/dom")
+@app.get("/debug/dom", include_in_schema=settings.ENABLE_DEBUG_ENDPOINTS)
 async def debug_dom():
     """Отладочный эндпоинт: возвращает структуру DOM (сообщения/поле ввода/кнопки)."""
     return await browser_session.introspect_dom()
@@ -754,49 +783,86 @@ async def debug_dom():
 @app.post("/v1/chat/new")
 async def new_chat():
     """Создаёт новый чат в интерфейсе DeepSeek и возвращает его id/URL."""
+    sess = await _pool_acquire_or_429()
     try:
-        url = await browser_session.new_chat()
-        chat_id = await browser_session.get_current_chat_id()
+        initial = settings.get_initial_message()
+        chat_id = await sess.prepare_chat(
+            initial_message=initial, create_new=True
+        )
+        await session_pool.bind_chat(sess, chat_id)
+        url = sess.get_current_url()
         return {"ok": True, "chat_id": chat_id, "url": url}
-    except BrowserSessionError as exc:
+    except (BrowserSessionError, RuntimeError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        await session_pool.release(sess)
 
 
 @app.get("/v1/chat/list")
 async def list_chats():
     """Возвращает список чатов из боковой панели DeepSeek."""
+    sess = await _pool_acquire_or_429()
     try:
-        chats = await browser_session.list_chats()
+        chats = await sess.list_chats()
         return {"chats": chats}
     except BrowserSessionError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        await session_pool.release(sess)
 
 
 @app.post("/v1/chat/switch")
 async def switch_chat(req: ChatSwitchRequest):
     """Переключается на чат с заданным conversation_id."""
+    sess = await _pool_acquire_or_429(req.chat_id)
     try:
-        await browser_session.switch_chat(req.chat_id)
+        await sess.switch_chat(req.chat_id)
+        current = await sess.get_current_chat_id()
+        if current != req.chat_id:
+            raise BrowserSessionError("DeepSeek не подтвердил переключение на указанный чат.")
+        await session_pool.bind_chat(sess, req.chat_id)
         return {"ok": True, "chat_id": req.chat_id}
     except BrowserSessionError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        await session_pool.release(sess)
 
 
 @app.get("/v1/chat/history")
-async def chat_history():
+async def chat_history(chat_id: Optional[str] = None):
     """Возвращает всю переписку текущего чата (role/content/reasoning)."""
+    if not chat_id and len(session_pool) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="При нескольких сессиях для history обязателен chat_id.",
+        )
+    sess = await _pool_acquire_or_429(chat_id)
     try:
-        messages = await browser_session.get_history()
-        return {"messages": messages}
+        if chat_id:
+            await sess.ensure_chat(chat_id)
+        messages = await sess.get_history()
+        current = await sess.get_current_chat_id()
+        await session_pool.bind_chat(sess, current)
+        return {"chat_id": current, "messages": messages}
     except BrowserSessionError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        await session_pool.release(sess)
 
 
 @app.post("/v1/chat/stop")
-async def stop_generation():
+async def stop_generation(chat_id: Optional[str] = None):
     """Прерывает текущую генерацию и возвращает то, что успело нагенериться."""
+    if not chat_id and len(session_pool) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="При нескольких сессиях для stop обязателен chat_id.",
+        )
+    sess = await session_pool.get_session_for_chat(chat_id)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="Активный чат не найден.")
     try:
-        content = await browser_session.stop_generation()
+        content = await sess.stop_generation()
         return {"ok": True, "content": content}
     except BrowserSessionError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -809,7 +875,7 @@ async def list_models():
     return {"object": "list", "data": model_registry.list_models(settings.MODE_TOGGLES)}
 
 
-@app.get("/debug/attach_probe")
+@app.get("/debug/attach_probe", include_in_schema=settings.ENABLE_DEBUG_ENDPOINTS)
 async def debug_attach_probe():
     """Диагностика загрузки файлов: какие input[type=file] есть в DOM, видимы ли,
     есть ли превью-чипы и кнопки-скрепки."""
@@ -842,7 +908,7 @@ async def debug_attach_probe():
     return {"ok": True, **info}
 
 
-@app.get("/debug/attach_send")
+@app.get("/debug/attach_send", include_in_schema=settings.ENABLE_DEBUG_ENDPOINTS)
 async def debug_attach_send(file: str = ""):
     """ВРЕМЕННЫЙ эксперимент: полный цикл на ГЛАВНОЙ (без new_chat):
     attach -> ожидание аплоада -> текст -> send -> ответ модели."""
@@ -886,7 +952,7 @@ async def debug_attach_send(file: str = ""):
     return {"ok": True, "answer": (answer or "")[:500]}
 
 
-@app.get("/debug/attach_try")
+@app.get("/debug/attach_try", include_in_schema=settings.ENABLE_DEBUG_ENDPOINTS)
 async def debug_attach_try(file: str = "", primer: str = ""):
     """Живой эксперимент: кладёт тестовый PNG в input[type=file] и возвращает,
     что показал composer (files, blob-превью, кусок HTML композера).
@@ -976,7 +1042,7 @@ async def debug_attach_try(file: str = "", primer: str = ""):
     return {"ok": True, **info}
 
 
-@app.get("/debug/shot")
+@app.get("/debug/shot", include_in_schema=settings.ENABLE_DEBUG_ENDPOINTS)
 async def debug_shot():
     """Скриншот текущей страницы primary-сессии (диагностика вёрстки)."""
     import tempfile as _tf
@@ -988,7 +1054,7 @@ async def debug_shot():
     return FileResponse(shot, media_type="image/png")
 
 
-@app.get("/debug/click")
+@app.get("/debug/click", include_in_schema=settings.ENABLE_DEBUG_ENDPOINTS)
 async def debug_click(x: int = 0, y: int = 0):
     """Клик по координатам на текущей странице (отладка без селекторов)."""
     if not browser_session._page:
@@ -998,7 +1064,7 @@ async def debug_click(x: int = 0, y: int = 0):
     return {"ok": True, "x": x, "y": y, "url": browser_session._page.url}
 
 
-@app.get("/debug/click_upload")
+@app.get("/debug/click_upload", include_in_schema=settings.ENABLE_DEBUG_ENDPOINTS)
 async def debug_click_upload(x: int = 0, y: int = 0, file: str = ""):
     """ВРЕМЕННЫЙ эксперимент: клик по координатам в ожидании file chooser,
     выбор файла через диалог (как живой пользователь), состояние превью."""
@@ -1029,7 +1095,7 @@ async def debug_click_upload(x: int = 0, y: int = 0, file: str = ""):
     return {"ok": True, **info}
 
 
-@app.get("/debug/send_current")
+@app.get("/debug/send_current", include_in_schema=settings.ENABLE_DEBUG_ENDPOINTS)
 async def debug_send_current(text: str = "Что на картинке?"):
     """ВРЕМЕННЫЙ эксперимент: отправляет текст в ТЕКУЩИЙ composer (где уже может
     лежать прикреплённый файл) и возвращает ответ модели."""
@@ -1048,7 +1114,7 @@ async def debug_send_current(text: str = "Что на картинке?"):
     return {"ok": True, "answer": (answer or "")[:500]}
 
 
-@app.get("/debug/composer_btns")
+@app.get("/debug/composer_btns", include_in_schema=settings.ENABLE_DEBUG_ENDPOINTS)
 async def debug_composer_btns():
     """ВРЕМЕННАЯ диагностика: соседи кнопки отправки (ищем скрепку структурно)."""
     if not browser_session._page:
@@ -1080,7 +1146,7 @@ async def debug_composer_btns():
     return {"ok": True, "items": items}
 
 
-@app.get("/debug/extract")
+@app.get("/debug/extract", include_in_schema=settings.ENABLE_DEBUG_ENDPOINTS)
 async def debug_extract():
     """Отладка: что возвращает извлечение ответа из текущей страницы."""
     if not browser_session._page:
@@ -1090,7 +1156,7 @@ async def debug_extract():
     return {"count": count, "text_len": len(text), "text": text[:500], "url": browser_session._page.url}
 
 
-@app.get("/debug/type_test")
+@app.get("/debug/type_test", include_in_schema=settings.ENABLE_DEBUG_ENDPOINTS)
 async def debug_type_test():
     """Отладка: набираем текст в textarea и читаем обратно input_value."""
     if not browser_session._page:
@@ -1133,12 +1199,13 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         raise HTTPException(
             status_code=400, detail="Поле 'messages' обязательно для отправки сообщения."
         )
+    _validate_chat_affinity(request)
 
     # Per-IP лимит — до захвата слота, чтобы не держать очередь зря.
     _check_rate_limit(http_request)
 
     # Свободная сессия пула (при одном профиле — строго по очереди).
-    sess = await _pool_acquire_or_429()
+    sess = await _pool_acquire_or_429(request.conversation_id)
 
     # Маппинг model -> режим (Deepseek-Think / Search / Think_Search).
     # Если model распознан - он имеет приоритет над флагами deep_think/search.
@@ -1152,7 +1219,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
 
     # Определяем источник приращений (kind, delta) в зависимости от режима запроса.
     # kind in {'reasoning','content'} - рассуждения DeepThink и итоговый ответ.
-    async def _source(nudge: bool = False):
+    source_has_created_chat = False
+
+    async def _source(nudge: bool = False, force_new: bool = False):
+        nonlocal source_has_created_chat
         # При повторе (nudge) докидываем подсказку «ответь текстом» в конец истории,
         # чтобы модель не возвращала пустой ответ и не вызывала инструменты зря.
         msgs = request.messages
@@ -1180,6 +1250,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             system_text = system_msgs[-1].content if system_msgs else ""
             last_user = _extract_last_user_message(msgs)
             mode = settings.MEMORY_MODE
+            try:
+                initial_message = settings.get_initial_message()
+            except RuntimeError as exc:
+                raise BrowserSessionError(str(exc)) from exc
 
             if mode == "client":
                 # Клиент сам шлёт всю историю: сплющиваем её в ОДИН промпт и
@@ -1192,8 +1266,11 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     sys_part = (sys_part + "\n\n" + tool_instr).strip() if sys_part else tool_instr
                 prompt = settings.SYSTEM_PROMPT_TEMPLATE.format(system=sys_part, user=conv) if sys_part else conv
                 file_paths = _save_images_to_tmp(last_user)
-                # В client-режиме ВСЕГДА новый чат (каждый запрос независим).
-                await sess.new_chat()
+                # В client-режиме каждый запрос получает новый тред. Bootstrap
+                # создаёт его первым сообщением и возвращает реальный chat_id.
+                target_chat_id = await sess.prepare_chat(
+                    initial_message=initial_message, create_new=True
+                )
                 if file_paths:
                     # Файлы понимает только режим распознавания (Vision):
                     # без него аплоад висит вечно, а модель слепа.
@@ -1208,7 +1285,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     file_paths,
                     deep_think=eff_deep_think,
                     search=eff_search,
-                    chat_id=None,
+                    chat_id=target_chat_id,
                 ):
                     yield kind, delta
             else:
@@ -1228,8 +1305,15 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     if sys_part:
                         prompt = settings.SYSTEM_PROMPT_TEMPLATE.format(system=sys_part, user=prompt)
                 file_paths = _save_images_to_tmp(last_user)
-                if request.new_chat:
-                    await sess.new_chat()
+                create_new = force_new or (
+                    request.new_chat and not source_has_created_chat
+                )
+                target_chat_id = await sess.prepare_chat(
+                    initial_message=initial_message,
+                    create_new=create_new,
+                    chat_id=None if create_new else request.conversation_id,
+                )
+                source_has_created_chat = source_has_created_chat or create_new
                 if file_paths:
                     vision = await sess.set_recognition_mode()
                     if not vision:
@@ -1239,7 +1323,11 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     file_paths,
                     deep_think=eff_deep_think,
                     search=eff_search,
-                    chat_id=request.conversation_id,
+                    chat_id=(
+                        target_chat_id
+                        if create_new
+                        else (target_chat_id or request.conversation_id)
+                    ),
                 ):
                     yield kind, delta
 
@@ -1352,6 +1440,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     prompt_tokens, completion_tokens
                 )
                 conv_id = await sess.get_current_chat_id()
+                await session_pool.bind_chat(sess, conv_id)
                 citations = []
                 if eff_search:
                     try:
@@ -1509,18 +1598,12 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 logger.info("busy-retry: #%d — ждём %.1fс перед повтором.",
                             busy_retries, delay_sec)
                 await asyncio.sleep(delay_sec)
-                # Новый чат + повторная отправка
-                await sess.new_chat()
-                if file_paths:
-                    vision = await sess.set_recognition_mode()
-                    if not vision:
-                        await sess.ensure_upload_chat()
+                # Новый чат + повторная отправка через тот же единый путь.
+                # Раньше здесь использовались prompt/file_paths из локальной
+                # области _source, что приводило к NameError.
                 rtext = ""
                 rreason = ""
-                async for kind, delta in sess.stream_message(
-                    prompt, file_paths,
-                    deep_think=eff_deep_think, search=eff_search,
-                ):
+                async for kind, delta in _source(force_new=True):
                     if kind == "reasoning":
                         rreason += delta
                     else:
@@ -1559,6 +1642,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         completion_tokens = _estimate_tokens(response_text)
         total_tokens, ds_counter = await _finalize_usage(prompt_tokens, completion_tokens)
         conv_id = await sess.get_current_chat_id()
+        await session_pool.bind_chat(sess, conv_id)
 
         citations = []
         if eff_search:
@@ -1591,10 +1675,16 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         await session_pool.release(sess)
 
 
-def _openai_error(status: int, message: str, etype: str) -> JSONResponse:
+def _openai_error(
+    status: int, message: str, etype: str, headers: Optional[dict] = None
+) -> JSONResponse:
     # OpenAI-совместимый вид ошибки, чтобы зод-валидирующие клиенты
     # (AI SDK и др.) выдавали понятное сообщение, а не "Type validation failed".
-    return JSONResponse(status_code=status, content={"error": {"message": message, "type": etype}})
+    return JSONResponse(
+        status_code=status,
+        content={"error": {"message": message, "type": etype}},
+        headers=headers,
+    )
 
 
 @app.exception_handler(BrowserSessionError)
@@ -1604,8 +1694,19 @@ async def browser_error_handler(_, exc: BrowserSessionError):
 
 @app.exception_handler(HTTPException)
 async def http_error_handler(_, exc: HTTPException):
-    etype = "invalid_request_error" if exc.status_code == 400 else "server_error"
-    return _openai_error(exc.status_code, str(exc.detail), etype)
+    etype = "invalid_request_error" if 400 <= exc.status_code < 500 else "server_error"
+    return _openai_error(
+        exc.status_code, str(exc.detail), etype, headers=exc.headers
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(_, exc: RequestValidationError):
+    details = []
+    for error in exc.errors():
+        location = ".".join(str(part) for part in error.get("loc", ()))
+        details.append(f"{location}: {error.get('msg', 'invalid value')}")
+    return _openai_error(422, "; ".join(details), "invalid_request_error")
 
 
 @app.exception_handler(Exception)

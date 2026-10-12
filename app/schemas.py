@@ -103,7 +103,9 @@ class ChatCompletionRequest(BaseModel):
     new_chat: bool = False
     edit: Optional[EditInstruction] = None
     regenerate: bool = False
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = Field(
+        default=None, pattern=r"^[0-9a-fA-F]{8,}(?:-[0-9a-fA-F]+)*$"
+    )
 
 
 class ChoiceMessage(BaseModel):
@@ -141,4 +143,6 @@ class ChatCompletionResponse(BaseModel):
 
 
 class ChatSwitchRequest(BaseModel):
-    chat_id: str
+    chat_id: str = Field(
+        min_length=8, pattern=r"^[0-9a-fA-F]{8,}(?:-[0-9a-fA-F]+)*$"
+    )

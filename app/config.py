@@ -54,8 +54,11 @@ class Settings:
     BROWSER_CHANNEL: str = os.getenv("BROWSER_CHANNEL", "chrome")
     # Опционально переопределить User-Agent (оставьте пустым для нативного).
     USER_AGENT: str = os.getenv("USER_AGENT", "")
-    # Режим анти-детекта: "" (выкл), "rebrowser" (rebrowser-patches, патч Chromium).
-    ANTIDETECT: str = os.getenv("ANTIDETECT", "")
+    # Backend автоматизации. patchright установлен манифестом и используется
+    # по умолчанию; playwright доступен только при отдельной установке.
+    BROWSER_BACKEND: str = os.getenv(
+        "BROWSER_BACKEND", os.getenv("ANTIDETECT", "patchright")
+    ).strip().lower()
     USER_DATA_DIR: str = os.getenv("USER_DATA_DIR", "./pw_profile")
     DB_PATH: str = os.getenv("DB_PATH", "./data/sessions.sqlite3")
     FERNET_KEY: str = _get_or_create_fernet_key()
@@ -118,12 +121,29 @@ class Settings:
     #            и каждый запрос начинает НОВЫЙ чат DeepSeek. Полностью stateless,
     #            нет утечки прошлых ответов. Нужен для opencode/Kilo Code.
     MEMORY_MODE: str = os.getenv("MEMORY_MODE", "server").strip().lower()
+    # Не отправлять продолжение server-диалога наугад, если клиент забыл
+    # conversation_id из предыдущего ответа.
+    STRICT_CHAT_AFFINITY: bool = (
+        os.getenv("STRICT_CHAT_AFFINITY", "true").lower() == "true"
+    )
+    # Опциональное первое сообщение, которое мост отправляет сам в каждый
+    # действительно новый чат до пользовательского запроса.
+    INITIAL_MESSAGE_ENABLED: bool = (
+        os.getenv("INITIAL_MESSAGE_ENABLED", "false").lower() == "true"
+    )
+    INITIAL_MESSAGE: str = os.getenv("INITIAL_MESSAGE", "").strip()
+    INITIAL_MESSAGE_FILE: str = os.getenv("INITIAL_MESSAGE_FILE", "").strip()
     # Рабочая директория проекта. Подсказывается модели, чтобы та использовала
     # абсолютные пути (независимо от cwd клиента, исполняющего команду).
     # Пусто = cwd процесса сервера (обычно папка, откуда запущен uvicorn).
     WORK_DIR: str = os.getenv("WORK_DIR", "").strip()
     MAX_FILES_PER_MESSAGE: int = int(os.getenv("MAX_FILES_PER_MESSAGE", "5"))
     MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "2"))
+
+    # /debug/* раскрывают DOM и могут менять страницу; по умолчанию закрыты.
+    ENABLE_DEBUG_ENDPOINTS: bool = (
+        os.getenv("ENABLE_DEBUG_ENDPOINTS", "false").lower() == "true"
+    )
 
     # --- Retry при "Server busy" ---
     # Макс. число повторных попыток при ответе DeepSeek «сервис занят».
@@ -249,6 +269,22 @@ class Settings:
     def get_timeout(base_ms: int) -> float:
         """Таймаут в миллисекундах с небольшой случайной погрешностью."""
         return _jitter(base_ms)
+
+    def get_initial_message(self) -> str:
+        """Текущее стартовое сообщение; файл перечитывается для каждого чата."""
+        if not self.INITIAL_MESSAGE_ENABLED:
+            return ""
+        if self.INITIAL_MESSAGE_FILE:
+            path = Path(self.INITIAL_MESSAGE_FILE)
+            if not path.is_absolute():
+                path = ENV_PATH.parent / path
+            try:
+                return path.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Не удалось прочитать INITIAL_MESSAGE_FILE={path}: {exc}"
+                ) from exc
+        return self.INITIAL_MESSAGE
 
 
 settings = Settings()
