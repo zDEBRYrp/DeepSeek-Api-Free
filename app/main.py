@@ -229,11 +229,18 @@ def _build_tool_instruction(tools: Optional[List[Tool]]) -> str:
     import os as _os
     work_dir = settings.WORK_DIR or _os.getcwd()
     lines = [
-        "Тебе доступны инструменты (function calling). Когда нужно вызвать инструмент, "
-        "оформи вызов как ОДНУ СТРОКУ чистого JSON без markdown-оформления — НЕ оборачивай "
-        "в ```json заборы, НЕ ставь переносы строк внутри JSON. Перед вызовом МОЖНО "
-        "написать краткое пояснение (например, 'Проверю файлы:'), но сам JSON-вызов "
-        "должен быть на отдельной строке и легко отделяться от текста:",
+        "Тебе доступны инструменты. Этот сервер превращает твой текст в реальный вызов "
+        "инструмента. Для terminal НЕ используй JSON и не пытайся вызвать функцию нативно: "
+        "верни РОВНО ОДИН code block с языком bash и одной командой внутри, например:",
+        "```bash\necho hello\n```",
+        "Не добавляй перед или после такого блока пояснений, JSON и второй команды. "
+        "Команды исполняются в Git Bash, даже на Windows. Используй синтаксис Bash, а не PowerShell. "
+        "Чтобы веб-интерфейс не портил команду, избегай циклов и сложных подстановок; предпочитай "
+        "одну прямую команду за вызов. "
+        "После результата terminal продолжай работу на его основе.",
+        "Для остальных инструментов используй одну строку чистого JSON без markdown-оформления. "
+        "Не ставь переносы строк внутри JSON. Перед вызовом МОЖНО написать краткое пояснение, "
+        "но сам JSON-вызов должен быть на отдельной строке и легко отделяться от текста:",
         '{"name": "<точное_имя_инструмента>", "arguments": { ... }}',
         "Имя инструмента должно быть ТОЧНО из списка ниже. Поле arguments — объект с "
         "параметрами по схеме инструмента. Когда получишь результат инструмента, "
@@ -403,6 +410,8 @@ def _cmd_to_toolcall(body: str, tool_names: set):
         mg = re.match(r'glob\s+(?:-[A-Za-z]+\s+)?["\']?([^"\'\n]+?)["\']?\s*$', body, re.IGNORECASE)
         if mg:
             return {"name": "glob", "arguments": {"pattern": mg.group(1).strip()}}
+    if "terminal" in tool_names:
+        return {"name": "terminal", "arguments": {"command": body}}
     if "bash" in tool_names:
         return {"name": "bash", "arguments": {"command": body}}
     return None
@@ -561,6 +570,46 @@ def _parse_tool_call(text: str, tools: Optional[List[Tool]]):
     for s, e, obj in _extract_json_objects(text):
         candidates.append((s, e, obj))
 
+    # Если DeepSeek сначала напечатал сломанный JSON с неэкранированными
+    # кавычками внутри command, а ниже — ещё один валидный вызов, общий JSON-
+    # разбор видит только второй и перескакивает через первое действие. Берём
+    # самый первый однострочный terminal-вызов и ремонтируем только его внешнюю
+    # оболочку. Содержимое команды не «угадываем» и не переписываем.
+    if "terminal" in _tool_names(tools):
+        for m in re.finditer(r'(?m)^[ \t]*\{\s*"command"\s*:\s*"', text):
+            line_end = text.find("\n", m.start())
+            if line_end < 0:
+                line_end = len(text)
+            raw = text[m.start():line_end].strip()
+            try:
+                if isinstance(json.loads(raw), dict):
+                    continue
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+
+            payload = text[m.end():line_end].strip()
+            timeout = None
+            suffix = re.search(
+                r'"\s*,\s*"timeout"\s*:\s*(\d+)\s*}\s*$', payload
+            )
+            if suffix:
+                command = payload[:suffix.start()]
+                timeout = int(suffix.group(1))
+            else:
+                suffix = re.search(r'"\s*}\s*$', payload)
+                if not suffix:
+                    continue
+                command = payload[:suffix.start()]
+            command = command.replace(r'\"', '"').strip()
+            if not command:
+                continue
+            arguments = {"command": command}
+            if timeout is not None:
+                arguments["timeout"] = timeout
+            remove_end = line_end + 1 if line_end < len(text) else line_end
+            stripped = (text[:m.start()] + text[remove_end:]).strip()
+            return [{"name": "terminal", "arguments": arguments}], stripped
+
     found = []  # (start, end, name, args)
     for s, e, raw in candidates:
         obj = raw if isinstance(raw, dict) else None
@@ -600,6 +649,22 @@ def _parse_tool_call(text: str, tools: Optional[List[Tool]]):
         calls = [{"name": n, "arguments": a} for _, _, n, a in found]
         return calls, stripped
 
+    # DeepSeek в некоторых браузерных ответах выбирает ``terminal`` во
+    # внутреннем интерфейсе, но в видимом тексте оставляет только аргументы:
+    # {"command": "..."}.  Это не полноценный OpenAI tool-call, поэтому
+    # обычный разбор выше закономерно его пропускает, а клиент получает
+    # ``command=None``. Восстанавливаем ТОЛЬКО однозначный вариант: terminal
+    # должен быть среди инструментов клиента, а command — непустая строка.
+    # Другие «безымянные» JSON-объекты намеренно не угадываем.
+    if "terminal" in _tool_names(tools):
+        for s, e, obj in candidates:
+            if not isinstance(obj, dict) or set(obj) - {"command"}:
+                continue
+            command = obj.get("command")
+            if isinstance(command, str) and command.strip():
+                stripped = (text[:s] + text[e:]).strip()
+                return [{"name": "terminal", "arguments": {"command": command}}], stripped
+
     # FALLBACK: сломанный fenced-JSON — name и arguments по отдельности.
     m_name = re.search(r'"name"\s*:\s*"([^"]*)"', text)
     if m_name:
@@ -628,7 +693,7 @@ def _parse_tool_call(text: str, tools: Optional[List[Tool]]):
     # иначе развёрнутые описания вроде «glob pattern * - path C:\...» превращаются
     # в мусорные вызовы и уводят клиента в бесконечный цикл перевызовов.
     tool_names = _tool_names(tools)
-    if tool_names & {"bash", "glob"}:
+    if tool_names & {"terminal", "bash", "glob"}:
         m_block = re.search(r"```(\w*)\n(.*?)\n```", text, re.DOTALL)
         if not m_block:
             m_block = re.search(r"```(\w*)\s*(.*?)\s*```", text, re.DOTALL)
