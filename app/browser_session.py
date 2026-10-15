@@ -231,6 +231,24 @@ class BrowserSession:
                     return loc.first
             except Exception:
                 pass
+
+        # Разметка DeepSeek меняется: текст иногда находится во вложенном span,
+        # а состояние и обработчик клика — на ближайшем button/контейнере.
+        for label in labels:
+            try:
+                text_loc = self._page.get_by_text(label, exact=False)
+                if await text_loc.count() == 0:
+                    continue
+                control = text_loc.first.locator(
+                    "xpath=ancestor-or-self::*["
+                    "@aria-pressed or @aria-checked or @data-pressed or @data-state "
+                    "or self::button or @role='button' or contains(@class,'toggle')"
+                    "][1]"
+                )
+                if await control.count() > 0:
+                    return control.first
+            except Exception:
+                pass
         return None
 
     async def _toggle_button(self, selector: str, enabled: bool, labels=None) -> None:
@@ -248,44 +266,120 @@ class BrowserSession:
             toggle_el = await self._find_toggle(labels)
 
         if toggle_el is None:
-            logger.warning("Не удалось найти кнопку (селектор=%s, метки=%s).", selector, labels)
-            return
+            raise BrowserSessionError(
+                f"Не удалось найти переключатель (селектор={selector!r}, метки={labels!r})."
+            )
 
         try:
-            for _ in range(4):
+            state = await self._read_toggle_state(toggle_el)
+            if state == enabled:
+                return
+            if state is None:
+                raise BrowserSessionError(
+                    "DeepSeek не сообщил текущее состояние переключателя; клик отменён."
+                )
+
+            # Только один клик. Повторные клики при медленном обновлении DOM могли
+            # вернуть кнопку в исходное состояние и отправить запрос не в том режиме.
+            await toggle_el.click()
+            for _ in range(6):
+                await asyncio.sleep(0.2)
                 state = await self._read_toggle_state(toggle_el)
                 if state == enabled:
                     return
-                # state is None (неизвестно) или противоположен нужному - кликаем
-                await toggle_el.click()
-                await asyncio.sleep(0.3)
-            state = await self._read_toggle_state(toggle_el)
-            if state != enabled:
-                logger.warning(
-                    "Не удалось установить переключатель в %s (состояние=%s).",
-                    enabled, state,
-                )
+
+            raise BrowserSessionError(
+                f"DeepSeek не подтвердил состояние переключателя {enabled} "
+                f"после клика (последнее состояние={state!r})."
+            )
+        except BrowserSessionError:
+            raise
         except Exception as exc:
-            logger.warning("Не удалось переключить кнопку: %s", exc)
+            raise BrowserSessionError(f"Не удалось переключить кнопку: {exc}") from exc
 
     async def _read_toggle_state(self, toggle_el) -> Optional[bool]:
         """Читает состояние тумблера ds-toggle-button.
         Возвращает True/False или None, если определить не удалось."""
         try:
-            is_pressed = await toggle_el.get_attribute("aria-pressed")
-            if is_pressed is None:
-                is_pressed = await toggle_el.get_attribute("data-pressed")
-            if is_pressed is not None:
-                return str(is_pressed).lower() in ("true", "1")
-            cls = await toggle_el.get_attribute("class") or ""
-            if "ds-toggle-button--selected" in cls:
-                return True
-            if "ds-toggle-button" in cls:
-                # базовый класс есть, а selected - нет => выключен
-                return False
+            snapshot = await toggle_el.evaluate(
+                """el => {
+                    const nodes = [];
+                    const add = node => {
+                        if (node && !nodes.includes(node)) nodes.push(node);
+                    };
+                    add(el);
+                    let parent = el.parentElement;
+                    for (let depth = 0; parent && depth < 4; depth += 1) {
+                        add(parent);
+                        parent = parent.parentElement;
+                    }
+                    for (const node of el.querySelectorAll(
+                        '[aria-pressed], [aria-checked], [data-pressed], '
+                        + '[data-state], button, [role="button"], [class*="toggle"]'
+                    )) {
+                        add(node);
+                        if (nodes.length >= 24) break;
+                    }
+                    return nodes.map(node => ({
+                        tag: node.tagName.toLowerCase(),
+                        className: typeof node.className === 'string' ? node.className : '',
+                        attributes: {
+                            'aria-pressed': node.getAttribute('aria-pressed'),
+                            'aria-checked': node.getAttribute('aria-checked'),
+                            'data-pressed': node.getAttribute('data-pressed'),
+                            'data-state': node.getAttribute('data-state'),
+                        },
+                    }));
+                }"""
+            )
+            return self._toggle_state_from_snapshot(snapshot)
         except Exception:
-            pass
+            # Поддержка кастомных ElementHandle из старых конфигураций.
+            try:
+                snapshot = [{
+                    "className": await toggle_el.get_attribute("class") or "",
+                    "attributes": {
+                        "aria-pressed": await toggle_el.get_attribute("aria-pressed"),
+                        "aria-checked": await toggle_el.get_attribute("aria-checked"),
+                        "data-pressed": await toggle_el.get_attribute("data-pressed"),
+                        "data-state": await toggle_el.get_attribute("data-state"),
+                    },
+                }]
+                return self._toggle_state_from_snapshot(snapshot)
+            except Exception:
+                pass
         return None
+
+    @staticmethod
+    def _toggle_state_from_snapshot(snapshot) -> Optional[bool]:
+        true_values = {"true", "1", "on", "checked", "selected", "active", "enabled", "open"}
+        false_values = {"false", "0", "off", "unchecked", "unselected", "inactive", "disabled", "closed"}
+        active_class = re.compile(r"(?:^|[-_\s])(selected|active|checked|enabled|on)(?:$|[-_\s])", re.I)
+        inactive_class = re.compile(r"(?:^|[-_\s])(unselected|inactive|unchecked|disabled|off)(?:$|[-_\s])", re.I)
+        has_base_toggle = False
+
+        for node in snapshot or []:
+            attrs = node.get("attributes") or {}
+            for name in ("aria-pressed", "aria-checked", "data-pressed", "data-state"):
+                value = attrs.get(name)
+                if value is None:
+                    continue
+                normalized = str(value).strip().lower()
+                if normalized in true_values:
+                    return True
+                if normalized in false_values:
+                    return False
+
+            class_name = str(node.get("className") or "")
+            if "ds-toggle-button" in class_name:
+                has_base_toggle = True
+            if inactive_class.search(class_name):
+                return False
+            if active_class.search(class_name):
+                return True
+
+        # В классической разметке DeepSeek базовый класс без --selected означает off.
+        return False if has_base_toggle else None
 
     # ---------- Создание нового чата ----------
 
