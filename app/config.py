@@ -131,6 +131,12 @@ class Settings:
     INITIAL_MESSAGE_ENABLED: bool = (
         os.getenv("INITIAL_MESSAGE_ENABLED", "false").lower() == "true"
     )
+    # Режим DeepSeek только для стартового сообщения. Основной запрос по-прежнему
+    # использует model/deep_think/search из OpenAI-совместимого запроса.
+    INITIAL_MESSAGE_MODEL: str = (
+        os.getenv("INITIAL_MESSAGE_MODEL", "deepseek-chat").strip().lower()
+        or "deepseek-chat"
+    )
     INITIAL_MESSAGE: str = os.getenv("INITIAL_MESSAGE", "").strip()
     INITIAL_MESSAGE_FILE: str = os.getenv("INITIAL_MESSAGE_FILE", "").strip()
     # Рабочая директория проекта. Подсказывается модели, чтобы та использовала

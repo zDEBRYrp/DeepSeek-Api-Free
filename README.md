@@ -48,8 +48,11 @@ OpenAI-совместимого клиента: поддерживаются р�
   - `client` — клиент шлёт всю историю; мост «сплющивает» её в одно сообщение
     и каждый запрос начинает **новый** чат DeepSeek (полностью stateless,
     без утечки прошлых ответов). НУЖЕН для opencode / Kilo Code.
-- **Стартовое сообщение нового чата**: `INITIAL_MESSAGE_ENABLED=true` и
-  `INITIAL_MESSAGE_FILE=./initial_message.txt`. Мост отправляет его первым,
+- **Стартовое сообщение нового чата**: `INITIAL_MESSAGE_ENABLED=true`,
+  `INITIAL_MESSAGE_MODEL=deepseek-chat` (или `deepseek-think`,
+  `deepseek-search`, `deepseek-think-search`) и
+  `INITIAL_MESSAGE_FILE=./initial_message.txt`. Мост отправляет его первым
+  в выбранном режиме, независимо от модели основного запроса,
   ждёт ответ, фиксирует настоящий `conversation_id` и проверяет, что основной
   запрос уходит в тот же тред. В `server` это происходит один раз при создании
   чата; в `client` — для каждого нового stateless-чата.

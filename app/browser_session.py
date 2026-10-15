@@ -345,6 +345,8 @@ class BrowserSession:
         self,
         *,
         initial_message: str = "",
+        initial_deep_think: bool = False,
+        initial_search: bool = False,
         create_new: bool = False,
         chat_id: Optional[str] = None,
     ) -> Optional[str]:
@@ -362,7 +364,12 @@ class BrowserSession:
             if not message or not is_fresh:
                 return current_id or chat_id
 
-            baseline = await self._submit_message(message, chat_id=current_id)
+            baseline = await self._submit_message(
+                message,
+                deep_think=initial_deep_think,
+                search=initial_search,
+                chat_id=current_id,
+            )
             await self._wait_response_complete(
                 wait_new=True, prompt=message, baseline_text=baseline
             )

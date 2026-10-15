@@ -20,12 +20,17 @@ class ChatInitializationTests(unittest.TestCase):
         session._wait_response_complete = AsyncMock(return_value=("", "ok"))
 
         result = run_inline(
-            session.prepare_chat(initial_message="bootstrap", create_new=True)
+            session.prepare_chat(
+                initial_message="bootstrap",
+                initial_deep_think=True,
+                initial_search=False,
+                create_new=True,
+            )
         )
 
         self.assertEqual(result, CHAT_A)
         session._submit_message.assert_awaited_once_with(
-            "bootstrap", chat_id=None
+            "bootstrap", deep_think=True, search=False, chat_id=None
         )
         session._wait_response_complete.assert_awaited_once()
 

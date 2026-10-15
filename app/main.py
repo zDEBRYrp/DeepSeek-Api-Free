@@ -97,6 +97,26 @@ def _check_rate_limit(http_request: Request) -> None:
         )
 
 
+def _get_initial_message_config() -> tuple[str, bool, bool]:
+    """Стартовый текст и независимый от основного запроса режим DeepSeek."""
+    message = settings.get_initial_message()
+    if not message:
+        return "", False, False
+
+    model = settings.INITIAL_MESSAGE_MODEL
+    if not model_registry.is_supported_model(model, settings.MODE_TOGGLES):
+        available = ", ".join(
+            item["id"] for item in model_registry.list_models(settings.MODE_TOGGLES)
+        )
+        raise RuntimeError(
+            f"Неизвестный INITIAL_MESSAGE_MODEL={model!r}. Доступно: {available}"
+        )
+    deep_think, search = model_registry.resolve_toggles(
+        model, settings.MODE_TOGGLES
+    )
+    return message, deep_think, search
+
+
 async def _pool_acquire_or_429(chat_id: Optional[str] = None):
     """Свободная сессия из пула (или 429, если все заняты / в cooldown)."""
     try:
@@ -761,6 +781,7 @@ async def healthz():
         "uptime": int(time.time() - _started_at),
         "mode": settings.MEMORY_MODE,
         "initial_message_enabled": settings.INITIAL_MESSAGE_ENABLED,
+        "initial_message_model": settings.INITIAL_MESSAGE_MODEL,
         "strict_chat_affinity": settings.STRICT_CHAT_AFFINITY,
         "pool": pool,
         "version": app.version,
@@ -785,9 +806,12 @@ async def new_chat():
     """Создаёт новый чат в интерфейсе DeepSeek и возвращает его id/URL."""
     sess = await _pool_acquire_or_429()
     try:
-        initial = settings.get_initial_message()
+        initial, initial_deep_think, initial_search = _get_initial_message_config()
         chat_id = await sess.prepare_chat(
-            initial_message=initial, create_new=True
+            initial_message=initial,
+            initial_deep_think=initial_deep_think,
+            initial_search=initial_search,
+            create_new=True,
         )
         await session_pool.bind_chat(sess, chat_id)
         url = sess.get_current_url()
@@ -1251,7 +1275,11 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             last_user = _extract_last_user_message(msgs)
             mode = settings.MEMORY_MODE
             try:
-                initial_message = settings.get_initial_message()
+                (
+                    initial_message,
+                    initial_deep_think,
+                    initial_search,
+                ) = _get_initial_message_config()
             except RuntimeError as exc:
                 raise BrowserSessionError(str(exc)) from exc
 
@@ -1269,7 +1297,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 # В client-режиме каждый запрос получает новый тред. Bootstrap
                 # создаёт его первым сообщением и возвращает реальный chat_id.
                 target_chat_id = await sess.prepare_chat(
-                    initial_message=initial_message, create_new=True
+                    initial_message=initial_message,
+                    initial_deep_think=initial_deep_think,
+                    initial_search=initial_search,
+                    create_new=True,
                 )
                 if file_paths:
                     # Файлы понимает только режим распознавания (Vision):
@@ -1310,6 +1341,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 )
                 target_chat_id = await sess.prepare_chat(
                     initial_message=initial_message,
+                    initial_deep_think=initial_deep_think,
+                    initial_search=initial_search,
                     create_new=create_new,
                     chat_id=None if create_new else request.conversation_id,
                 )

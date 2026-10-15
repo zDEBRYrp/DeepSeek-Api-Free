@@ -87,7 +87,10 @@ class ManagementEndpointTests(unittest.TestCase):
             created = run_inline(main.new_chat())
         self.assertEqual(created["chat_id"], CHAT_A)
         self.session.prepare_chat.assert_awaited_with(
-            initial_message="boot", create_new=True
+            initial_message="boot",
+            initial_deep_think=False,
+            initial_search=False,
+            create_new=True,
         )
 
         listed = run_inline(main.list_chats())
@@ -151,7 +154,11 @@ class ManagementEndpointTests(unittest.TestCase):
         self.assertEqual(response.conversation_id, CHAT_A)
         self.assertEqual(response.choices[0].message.content, "answer")
         self.session.prepare_chat.assert_awaited_once_with(
-            initial_message="boot", create_new=False, chat_id=None
+            initial_message="boot",
+            initial_deep_think=False,
+            initial_search=False,
+            create_new=False,
+            chat_id=None,
         )
         self.assertEqual(self.session.last_stream_kwargs["chat_id"], CHAT_A)
         self.assertEqual(self.pool.bound[-1], (self.session, CHAT_A))
@@ -199,7 +206,11 @@ class ManagementEndpointTests(unittest.TestCase):
 
         self.assertEqual(response.choices[0].message.content, "answer")
         self.session.prepare_chat.assert_awaited_once_with(
-            initial_message="", create_new=True, chat_id=None
+            initial_message="",
+            initial_deep_think=False,
+            initial_search=False,
+            create_new=True,
+            chat_id=None,
         )
         self.assertIsNone(self.session.last_stream_kwargs["chat_id"])
 
@@ -224,8 +235,23 @@ class ManagementEndpointTests(unittest.TestCase):
         self.assertEqual(response.choices[0].message.content, "answer")
         self.assertEqual(self.session.prepare_chat.await_count, 2)
         self.session.prepare_chat.assert_any_await(
-            initial_message="boot", create_new=True, chat_id=None
+            initial_message="boot",
+            initial_deep_think=False,
+            initial_search=False,
+            create_new=True,
+            chat_id=None,
         )
+
+    def test_initial_message_uses_its_own_model(self):
+        with (
+            patch.object(main.settings, "get_initial_message", return_value="boot"),
+            patch.object(main.settings, "INITIAL_MESSAGE_MODEL", "deepseek-think-search"),
+        ):
+            message, deep_think, search = main._get_initial_message_config()
+
+        self.assertEqual(message, "boot")
+        self.assertTrue(deep_think)
+        self.assertTrue(search)
 
 
 if __name__ == "__main__":
